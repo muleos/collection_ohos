@@ -205,9 +205,12 @@ const RESOLVER_JS: string = `(function () {
       }
     }
   }
-  if (title.length === 0 || author.length === 0 ||
-    (isImagePost && images.length === 0) || (!isImagePost && videoUrl.length === 0)) {
+  if (title.length === 0 || (isImagePost && images.length === 0) ||
+    (!isImagePost && videoUrl.length === 0)) {
     return '{}';
+  }
+  if (author.length === 0) {
+    author = '抖音创作者';
   }
   return JSON.stringify({
     desc: title,
@@ -224,8 +227,12 @@ const RESOLVER_JS: string = `(function () {
 })();`;
 
 /** 单次解析的注入尝试上限与间隔（挑战跳转后每次 onPageEnd 重置）。 */
-const MAX_ATTEMPTS: number = 8;
+const MAX_ATTEMPTS: number = 10;
 const RETRY_DELAY_MS: number = 1400;
+/** 解析总超时：挑战跳转 + 异步数据可能超过 30s。 */
+const RESOLVE_TIMEOUT_MS: number = 45000;
+/** loadUrl 失败重试上限（控制器未就绪等瞬时错误）。 */
+const MAX_LOAD_RETRIES: number = 6;
 
 /**
  * 服务层调用的桥（单例）：resolve(pageUrl) → Promise<json 字符串>。
@@ -247,7 +254,7 @@ export class DouyinResolverBridge {
       DouyinResolverBridge.pending = resolve;
       DouyinResolverBridge.timeoutId = setTimeout((): void => {
         DouyinResolverBridge.finish('');
-      }, 30000);
+      }, RESOLVE_TIMEOUT_MS);
       DouyinResolverBridge.loader(pageUrl);
     });
   }
@@ -272,29 +279,60 @@ export class DouyinResolverBridge {
 }
 
 /** 隐藏 Web 解析组件：Index 根 Stack 常驻挂载。
- *  v1.26.6：屏外渲染（position 移出视口 + opacity 0.01），保证 WebView
- *  正常加载页面并执行 JS 挑战脚本——此前 Hidden 不渲染导致加载不启动。 */
+ *  v1.26.7 重构修复（真机上 WebView 通道从未生效的根因）：
+ *  ArkWeb 的 loadUrl 必须在控制器 attach 之后调用——此前 aboutToAppear 注册
+ *  loader 时控制器尚未 attach，应用启动后立刻解析会触发 "controller not
+ *  attached" 异常，catch 后 finish('') 静默失败，WebView 通道形同虚设。
+ *  现在 loader 在未 ready 时缓存 URL，onControllerAttached 后立即加载；
+ *  loadUrl 瞬时失败也按计数重试而非直接放弃。 */
 @Component
 export struct DouyinWebResolver {
   @State currentUrl: string = '';
   private controller: webview.WebviewController = new webview.WebviewController();
   /** 当前页面的注入尝试计数（页面跳转重置）。 */
   private attempts: number = 0;
+  /** 控制器是否已 attach（attach 后 loadUrl 才可用）。 */
+  private ready: boolean = false;
+  /** 未 ready 期间到达的加载请求。 */
+  private pendingUrl: string = '';
+  /** loadUrl 瞬时失败计数。 */
+  private loadRetries: number = 0;
 
   aboutToAppear(): void {
     DouyinResolverBridge.loader = (url: string): void => {
-      try {
-        this.currentUrl = url;
-        this.attempts = 0;
-        this.controller.loadUrl(url);
-      } catch (e) {
-        DouyinResolverBridge.finish('');
+      this.currentUrl = url;
+      this.attempts = 0;
+      this.loadRetries = 0;
+      if (!this.ready) {
+        // 控制器尚未 attach：缓存 URL，onControllerAttached 后加载
+        this.pendingUrl = url;
+        return;
       }
+      this.loadWithRetry(url);
     };
   }
 
   aboutToDisappear(): void {
     DouyinResolverBridge.loader = null;
+  }
+
+  private loadWithRetry(url: string): void {
+    try {
+      this.controller.loadUrl(url);
+    } catch (e) {
+      // 控制器瞬时不可用：重试而不是放弃（放弃=整个解析静默失败）
+      this.loadRetries++;
+      if (this.loadRetries > MAX_LOAD_RETRIES) {
+        DouyinResolverBridge.finish('');
+        return;
+      }
+      const next = url;
+      setTimeout((): void => {
+        if (DouyinResolverBridge.hasPending()) {
+          this.loadWithRetry(next);
+        }
+      }, 1000);
+    }
   }
 
   /** 单轮注入：有效 JSON 立即交付；无效则按重试间隔再试，至上限。 */
@@ -343,6 +381,14 @@ export struct DouyinWebResolver {
       .multiWindowAccess(false)
       .zoomAccess(false)
       .userAgent(RESOLVER_UA)
+      .onControllerAttached(() => {
+        this.ready = true;
+        if (this.pendingUrl.length > 0) {
+          const url = this.pendingUrl;
+          this.pendingUrl = '';
+          this.loadWithRetry(url);
+        }
+      })
       .onPageEnd(() => {
         // 挑战脚本跳转会再次触发 onPageEnd：重置计数重新注入
         this.attempts = 0;

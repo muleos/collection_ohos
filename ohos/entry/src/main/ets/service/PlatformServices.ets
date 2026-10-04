@@ -47,10 +47,11 @@ interface TitleAuthor {
   author: string;
 }
 
-/** getFollow 的返回：正文 + 最终 URL。 */
+/** getFollow 的返回：正文 + 最终 URL + 收集到的 Cookie。 */
 class HttpPage {
   text: string = '';
   finalUrl: string = '';
+  cookies: string = '';
 }
 
 /** 镜像直链分类结果：kind = 'video' | 'image' | 'cover'。 */
@@ -138,10 +139,12 @@ class Http {
     }
   }
 
-  /** GET，手动跟随跳转，返回正文与最终 URL（短链解析需要）。 */
+  /** GET，手动跟随跳转，返回正文与最终 URL（短链解析需要）。
+   *  cookie 参数非空时作为请求 Cookie 头发送；sendCookies 时收集每跳 Set-Cookie。 */
   static async getFollow(url: string, ua: string, referer: string, maxHops: number,
-    forceSystem: boolean = false): Promise<HttpPage> {
+    forceSystem: boolean = false, cookie: string = '', sendCookies: boolean = false): Promise<HttpPage> {
     const out = new HttpPage();
+    const collected: string[] = [];
     let current: string = url;
     for (let hop = 0; hop < maxHops; hop++) {
       let req: http.HttpRequest | null = null;
@@ -157,6 +160,9 @@ class Http {
         };
         if (referer.length > 0) {
           header['Referer'] = referer;
+        }
+        if (cookie.length > 0) {
+          header['Cookie'] = cookie;
         }
         const opt: http.HttpRequestOptions = {
           method: http.RequestMethod.GET,
@@ -175,11 +181,22 @@ class Http {
         body = typeof resp.result === 'string' ? (resp.result as string) : '';
         const raw: Object | undefined = resp.header;
         if (raw !== undefined && raw !== null) {
-          const h = raw as Record<string, string>;
+          const h = raw as Record<string, Object>;
           for (const k of Object.keys(h)) {
-            if (k.toLowerCase() === 'location') {
+            const lk = k.toLowerCase();
+            if (lk === 'location') {
               const v = h[k];
               location = typeof v === 'string' ? v : '';
+            } else if (sendCookies && (lk === 'set-cookie' || lk === 'setcookie')) {
+              // 多条 Set-Cookie 在 ohos http 里可能是 string 或 Array，统一归一化
+              const v = h[k];
+              if (typeof v === 'string') {
+                collected.push(v);
+              } else if (Array.isArray(v)) {
+                for (const item of v as Array<Object>) {
+                  collected.push(String(item));
+                }
+              }
             }
           }
         }
@@ -195,8 +212,56 @@ class Http {
       }
       out.text = code >= 200 && code < 400 ? body : '';
       out.finalUrl = current;
+      out.cookies = Http.mergeCookies(collected);
       return out;
     }
+    return out;
+  }
+
+  /**
+   * 两段式握手 GET（抖音分享页等 JS 挑战壳场景）：首请求收集 Set-Cookie
+   * （ttwid/__ac_nonce），带 Cookie 重放一次拿真实页面。
+   */
+  static async getWithCookieFlow(url: string, ua: string, referer: string, maxHops: number,
+    challengeMarker: string = 'jsvmprt'): Promise<HttpPage> {
+    const first = await Http.getFollow(url, ua, referer, maxHops, false, '', true);
+    if (first.text.length === 0 || first.cookies.length === 0) {
+      return first;
+    }
+    // 已是真实页面（无挑战壳）就不浪费第二次请求
+    if (first.text.indexOf(challengeMarker) < 0 && first.text.indexOf('_ROUTER_DATA') >= 0) {
+      return first;
+    }
+    return await Http.getFollow(url, ua, referer, maxHops, false, first.cookies, true);
+  }
+
+  /** 归一化收集到的 Set-Cookie：取每个 cookie 的 name=value，按 name 去重。 */
+  static mergeCookies(raw: string[]): string {
+    const map = new Map<string, string>();
+    for (const line of raw) {
+      // 一段 Set-Cookie 可能内含多个（逗号分隔，如 Expires 的逗号需排除）
+      const parts = line.split(/,(?=[A-Za-z0-9_]+=)/);
+      for (const part of parts) {
+        const seg = part.trim();
+        const eq = seg.indexOf('=');
+        if (eq <= 0) {
+          continue;
+        }
+        const name = seg.slice(0, eq).trim();
+        let value = seg.slice(eq + 1);
+        const semi = value.indexOf(';');
+        if (semi >= 0) {
+          value = value.slice(0, semi);
+        }
+        if (name.length > 0 && /^[A-Za-z0-9_$]+$/.test(name)) {
+          map.set(name, value);
+        }
+      }
+    }
+    let out = '';
+    map.forEach((value: string, key: string): void => {
+      out += (out.length > 0 ? '; ' : '') + key + '=' + value;
+    });
     return out;
   }
 
@@ -469,7 +534,10 @@ export class DouyinService {
   static async parse(url: string): Promise<ParseResult> {
     const failed = DouyinService.fail(url);
     const entry = DouyinService.shareUrl(url);
-    const page = await Http.getFollow(entry, IOS_UA, 'https://www.douyin.com/', 6);
+    // 通道〇（v1.26.7）：两段式握手——首请求收集 ttwid/__ac_nonce，带 Cookie
+    // 重放。2026 年分享页对裸请求回挑战壳，数据改为客户端异步加载，
+    // 带上握手 Cookie 至少能拿到完整 shell（数据回归时此通道立即生效）。
+    const page = await Http.getWithCookieFlow(entry, IOS_UA, 'https://www.douyin.com/', 6);
     const sourceUrl = page.finalUrl.length > 0 ? page.finalUrl : (entry.length > 0 ? entry : url);
     failed.sourceUrl = sourceUrl;
     const id = DouyinService.awemeId(sourceUrl.length > 0 ? sourceUrl : url);
@@ -1779,8 +1847,7 @@ export class InstagramService {
     const postType = InstagramService.postType(target);
     const hasProxy = NetProxy.host.length > 0;
     let mirrorTried = false;
-    // 通道〇a（新增，免代理）：InstaFix 系镜像 302 直出真实媒体直链。
-    // 国内直连可达——与 X 走 fxtwitter 主通道同一思路；未配代理时排最前。
+    let appApiTried = false;
     const tryMirror = async (): Promise<ParseResult | null> => {
       if (mirrorTried) {
         return null;
@@ -1788,10 +1855,29 @@ export class InstagramService {
       mirrorTried = true;
       return InstagramService.mirrorParse(code, postType, target);
     };
+    const tryAppApi = async (): Promise<ParseResult> => {
+      if (appApiTried) {
+        const miss = new ParseResult();
+        miss.platform = Platform.INSTAGRAM;
+        miss.status = ParseStatus.PARSE_FAILED;
+        miss.message = 'app api 已尝试';
+        return miss;
+      }
+      appApiTried = true;
+      return InstagramService.appApiParse(code, target);
+    };
     if (!hasProxy) {
+      // 免代理：镜像 302 直出真实媒体直链（单图/封面），国内直连可达
       const mirror = await tryMirror();
       if (mirror !== null) {
         return mirror;
+      }
+    } else {
+      // 配了代理：App API 优先（v1.26.7 重构）——对数据中心 IP 比
+      // 网页通道宽容得多，免登录全量数据（轮播/视频/作者文案）
+      const appApi = await tryAppApi();
+      if (appApi.status === ParseStatus.OK && appApi.mediaItems.length > 0) {
+        return appApi;
       }
     }
     // 通道〇b（主）：帖子页 HTML xig_polaris_media（需代理）
@@ -1806,10 +1892,10 @@ export class InstagramService {
       gql.sourceUrl = target;
       return gql;
     }
-    // 通道一点五（新增）：i.instagram App API（公开帖免登录，需代理）
-    const appApi = await InstagramService.appApiParse(code, target);
-    if (appApi.status === ParseStatus.OK && appApi.mediaItems.length > 0) {
-      return appApi;
+    // 通道一点五：App API（前面没试过时再试）
+    const appApi2 = await tryAppApi();
+    if (appApi2.status === ParseStatus.OK && appApi2.mediaItems.length > 0) {
+      return appApi2;
     }
     // 通道二（备）：embed/captioned 页（v1.26.6 提取为方法 + 双 UA 变体）。
     // 注意新版 embed 页的 JSON 已转义塞进 contextJSON（\"shortcode_media\"
@@ -1824,7 +1910,13 @@ export class InstagramService {
     if (mirror2 !== null) {
       return mirror2;
     }
-    failed.message = 'Instagram 解析失败（该域名在国内网络受限，或作品需登录）。可在「设置 → 网络」配置代理（如 127.0.0.1:7890）并开启「代理下载」后重试，或改用「网页提取」';
+    if (!hasProxy) {
+      failed.message = 'Instagram 解析失败：未配置代理，视频与多图作品无法获取' +
+        '（镜像站仅能取到单张照片）。请在「设置 → 网络」配置代理（如 127.0.0.1:7890）并开启「代理下载」后重试';
+    } else {
+      failed.message = 'Instagram 解析失败（代理通道被登录墙拦截或作品需登录）。' +
+        '可尝试更换代理节点后重试，或改用「网页提取」';
+    }
     failed.webFallback = true;
     return failed;
   }
