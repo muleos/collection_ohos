@@ -296,6 +296,20 @@ const RESOLVER_JS: string = `(function () {
   }
   if (title.length === 0 || (isImagePost && images.length === 0) ||
     (!isImagePost && videoUrl.length === 0)) {
+    // v1.29.0 挑战检测（datatool 渲染池同构思路的拼图）：页面卡在
+    // jsvmp 风控壳/验证码时，空转轮询只会浪费 20s 超时窗口——返回
+    // challenge 哨兵，组件侧 reload 重放挑战（浏览器过挑战靠页面自身
+    // 脚本跳转，reload 给它重来一次的机会）。
+    var isChallenge = false;
+    try {
+      isChallenge = typeof window._$jsvmprt === 'function' ||
+        document.body.innerHTML.indexOf('jsvmprt') >= 0 ||
+        location.href.indexOf('/verify') >= 0 ||
+        !!document.querySelector('#captcha_container, .captcha-verify-container, #secsdk-captcha');
+    } catch (challengeError) {}
+    if (isChallenge) {
+      return '{"challenge":true}';
+    }
     try {
       var playBtn = document.querySelector('.play-button, [data-e2e="play-button"], .player-play, .video-play');
       if (playBtn && playBtn.click) { playBtn.click(); }
@@ -419,6 +433,8 @@ export struct DouyinWebResolver {
   private pendingUrl: string = '';
   /** loadUrl 瞬时失败计数。 */
   private loadRetries: number = 0;
+  /** 挑战重放计数（v1.29.0：挑战壳 reload 自愈，上限 2 次）。 */
+  private challengeReloads: number = 0;
 
   aboutToAppear(): void {
     DouyinResolverBridge.loader = (url: string): void => {
@@ -468,6 +484,25 @@ export struct DouyinWebResolver {
       this.controller.runJavaScript(RESOLVER_JS)
         .then((value: string): void => {
           const text = normalizeInjected(value);
+          // v1.29.0：挑战壳哨兵 → reload 重放挑战脚本（浏览器路径），
+          // 而不是空转轮询烧完超时窗口。
+          if (text === '{"challenge":true}') {
+            if (this.challengeReloads < 2 && DouyinResolverBridge.hasPending()) {
+              this.challengeReloads++;
+              this.attempts = 0;
+              // 释放循环标志：reload 完成后的 onPageEnd 会重新拉起轮询
+              this.polling = false;
+              try {
+                this.controller.refresh();
+              } catch (e) {
+                this.loadWithRetry(this.currentUrl);
+              }
+              return;
+            }
+            DouyinResolverBridge.finish('');
+            this.polling = false;
+            return;
+          }
           if (text.length > 2 && text !== '{}' && text !== 'null') {
             DouyinResolverBridge.finish(text);
             this.polling = false;

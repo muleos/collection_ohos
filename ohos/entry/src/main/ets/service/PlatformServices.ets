@@ -564,54 +564,15 @@ export class DouyinService {
     const sourceUrl = page.finalUrl.length > 0 ? page.finalUrl : (entry.length > 0 ? entry : url);
     failed.sourceUrl = sourceUrl;
     const id = DouyinService.awemeId(sourceUrl.length > 0 ? sourceUrl : url);
-    if (page.text.length > 0) {
-      const fromRouter = DouyinService.tryRouterData(page.text, sourceUrl);
-      if (fromRouter !== null) {
-        return fromRouter;
-      }
-      const scraped = DouyinService.fromHtmlUrls(page.text, sourceUrl);
-      if (scraped !== null) {
-        return scraped;
-      }
-    }
-    if (id.length > 0) {
-      const www = await Http.getFollow('https://www.douyin.com/video/' + id, IOS_UA, 'https://www.douyin.com/', 4);
-      if (www.text.length > 0) {
-        const r = DouyinService.tryRouterData(www.text, sourceUrl);
-        if (r !== null) {
-          return r;
-        }
-        const s = DouyinService.fromHtmlUrls(www.text, sourceUrl);
-        if (s !== null) {
-          return s;
-        }
-      }
-      const itemInfo = await Http.getText('https://www.iesdouyin.com/web/api/v2/aweme/iteminfo/?item_ids=' + id,
-        IOS_UA, 'https://www.douyin.com/');
-      if (itemInfo.length > 0) {
-        const r = DouyinService.fromItemList(itemInfo, sourceUrl);
-        if (r !== null) {
-          return r;
-        }
-      }
-      // web detail API（v1.27.0 修复）：videdown 同款 PC web 接口，桌面 Chrome UA +
-      // 握手 Cookie（ttwid）+ Referer；响应字段是 aweme_detail（此前误用
-      // item_list 解析器导致拿到数据也解析失败）。仍兼容 item_list 结构。
-      const detail = await Http.getFollow('https://www.douyin.com/aweme/v1/web/aweme/detail/?device_platform=webapp' +
-        '&aid=6383&channel=channel_pc_web&aweme_id=' + id + '&pc_client_type=1&version_code=170400' +
-        '&version_name=17.4.0&cookie_enabled=true&platform=PC&downlink=10',
-      CHROME_UA, 'https://www.douyin.com/', 1, true, page.cookies, false);
-      if (detail.text.length > 0) {
-        const r = DouyinService.fromAwemeDetail(detail.text, sourceUrl);
-        if (r !== null) {
-          return r;
-        }
-        const r2 = DouyinService.fromItemList(detail.text, sourceUrl);
-        if (r2 !== null) {
-          return r2;
-        }
-      }
-    }
+    // v1.29.0（datatool.vip 参考古后收敛）：静态通道全部短路。
+    // 2026-10-04 实测——iesdouyin 分享页整页 jsvmp 挑战壳（_$jsvmprt，
+    // _ROUTER_DATA 内联数据已消失）、www.douyin.com 桌面页对裸请求同样
+    // 挑战、web detail API 200 空 body（需 msToken/a_bogus 签名）、
+    // iteminfo 旧接口死透。datatool.vip 等在线解析站的共性是服务端
+    // 浏览器渲染池——对应本应用的 ArkWeb 同构方案（页面自己过挑战 +
+    // 页面 JS 自己算签名调 detail API，钩子只拦截响应）。此前的静态
+    // 四通道每单解析浪费 4 次请求与数秒超时，直接砍掉；握手仅用于
+    // v.douyin.com 短链跟跳拿 aweme id。数据统一走下方 WebView 通道。
     // 通道四（兜底，v1.26.5，SaveAny 同款）：隐藏 WebView 加载分享页，
     // 多轮注入抓 _ROUTER_DATA + DOM——直连被 JS 挑战壳/风控拦住时，
     // WebView 内核执行挑战脚本跳到真实页面后仍能拿到完整作品数据。
