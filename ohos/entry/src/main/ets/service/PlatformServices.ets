@@ -5,6 +5,7 @@
  */
 import { http } from '@kit.NetworkKit';
 import { ParseResult, ParseStatus, Platform, WorkType, MediaItem } from '../model/SaveModels';
+import { DouyinResolverBridge } from './DouyinResolver';
 
 const IOS_UA: string = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 ' +
   '(KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1';
@@ -513,9 +514,45 @@ export class DouyinService {
         }
       }
     }
-    failed.message = '抖音直连解析失败（平台风控或需登录），可改用「网页提取」';
+    // 通道四（兜底，v1.26.5，SaveAny 同款）：隐藏 WebView 加载分享页，
+    // onPageEnd 后注入 JS 抓 _ROUTER_DATA + DOM——直连被风控/异步加载
+    // 拦住时，WebView 内核渲染后仍能拿到完整作品数据。
+    const webUrl = entry.length > 0 ? entry : url;
+    const viaWeb = await DouyinResolverBridge.resolve(webUrl);
+    if (viaWeb.length > 0 && viaWeb !== '{}') {
+      const r = DouyinService.fromResolverJson(viaWeb, sourceUrl);
+      if (r !== null) {
+        return r;
+      }
+    }
+    failed.message = '抖音解析失败（平台风控或需登录），可改用「网页提取」';
     failed.webFallback = true;
     return failed;
+  }
+
+  /** WebView 注入脚本返回的 JSON → ParseResult（复用 buildFromAweme 映射）。 */
+  static fromResolverJson(jsonText: string, sourceUrl: string): ParseResult | null {
+    try {
+      const root = JSON.parse(jsonText) as Record<string, Object>;
+      const item: Record<string, Object> = {};
+      item['desc'] = root['desc'] as Object;
+      const author = root['author'] as Record<string, Object>;
+      const authorOut: Record<string, Object> = {};
+      if (author !== null && author !== undefined) {
+        authorOut['nickname'] = author['nickname'] as Object;
+      }
+      item['author'] = authorOut as Object;
+      item['images'] = root['images'] as Object;
+      item['music'] = root['music'] as Object;
+      item['video'] = root['video'] as Object;
+      const result = new ParseResult();
+      result.platform = Platform.DOUYIN;
+      result.sourceUrl = sourceUrl;
+      const built = DouyinService.buildFromAweme(item, result);
+      return built.status === ParseStatus.OK ? built : null;
+    } catch (e) {
+      return null;
+    }
   }
 
   static mapRouterData(jsonText: string, sourceUrl: string): ParseResult {
@@ -1413,11 +1450,40 @@ export class InstagramService {
           }
           continue;
         }
-        const poster = direct.kind === 'video' ? '' : direct.url;
-        return InstagramService.buildMirrorResult(direct.url, poster, sourceUrl);
+        if (direct.kind === 'image') {
+          // v1.26.5：轮播展开——img_index 逐张探测（IG 轮播上限 20）。
+          // 重定向型实例：302 直出该张直链；HTML 型实例：og:image 指向
+          // /images/{code}/{idx} 再跟跳。越界/重复/封面帧/网格图即停，
+          // 单图帖第 2 张会原样返回第一张，仅多一次请求。
+          const items: MirrorMedia[] = [direct];
+          for (let idx = 2; idx <= 20; idx++) {
+            const p2 = await Http.getFollow(`https://${host}/${postType}/${code}/?img_index=${idx}`,
+              InstagramService.BOT_UA, '', 3, true);
+            let d2 = InstagramService.directMediaFromFollow(p2.finalUrl);
+            if (d2 === null && p2.text.length > 0) {
+              const og2 = InstagramService.metaContent(p2.text, 'og:image');
+              if (og2.length > 0 && og2.indexOf('/grid/') < 0) {
+                const abs2 = og2.indexOf('/') === 0 ? `https://${host}${og2}` : og2;
+                const pg3 = await Http.getFollow(abs2, InstagramService.BOT_UA, '', 3, true);
+                d2 = InstagramService.directMediaFromFollow(pg3.finalUrl);
+              }
+            }
+            if (d2 === null || d2.kind !== 'image') {
+              break;
+            }
+            const d2url: string = d2.url;
+            if (items.some((it: MirrorMedia): boolean => it.url === d2url)) {
+              break;
+            }
+            items.push(d2);
+          }
+          return InstagramService.buildMirrorResultMulti(items, sourceUrl);
+        }
+        // 视频 mp4 直链
+        return InstagramService.buildMirrorResult(direct.url, '', sourceUrl);
       }
       if (page.text.length > 0) {
-        const r = await InstagramService.mirrorFromHtml(page.text, host, code, sourceUrl);
+        const r = await InstagramService.mirrorFromHtml(page.text, host, code, sourceUrl, postType);
         if (r !== null) {
           return r;
         }
@@ -1434,6 +1500,11 @@ export class InstagramService {
     const lower = finalUrl.toLowerCase();
     const isCdn = lower.indexOf('fbcdn.net') >= 0 || lower.indexOf('cdninstagram.com') >= 0;
     if (!isCdn) {
+      return null;
+    }
+    // v1.26.5：头像直链过滤（profile pic 目录 t51.2885-19 / 150x150 缩略）——
+    // 不是帖子照片，误用会导致「只解析到头像」
+    if (lower.indexOf('2885-19') >= 0 || lower.indexOf('/s150x150/') >= 0) {
       return null;
     }
     if (lower.indexOf('.mp4') >= 0 || lower.indexOf('/o1/v/') >= 0) {
@@ -1468,7 +1539,8 @@ export class InstagramService {
   }
 
   /** 上游原版镜像返回 HTML：og:video/og:image 指向 /videos/ /images/ 相对路径，跟跳拿直链。 */
-  static async mirrorFromHtml(html: string, host: string, code: string, sourceUrl: string): Promise<ParseResult | null> {
+  static async mirrorFromHtml(html: string, host: string, code: string, sourceUrl: string,
+    postType: string): Promise<ParseResult | null> {
     const videoMeta = InstagramService.metaContent(html, 'og:video');
     const imageMeta = InstagramService.metaContent(html, 'og:image');
     const resolve = async (meta: string): Promise<MirrorMedia | null> => {
@@ -1495,6 +1567,34 @@ export class InstagramService {
       return null;
     }
     if (imageMeta.length > 0) {
+      if (imageMeta.indexOf('/grid/') >= 0) {
+        // v1.26.5：轮播帖——上游多图时 og:image 指向 /grid/ 网格拼图，
+        // 改为逐张 img_index 探测展开（og:image → /images/{code}/{idx}）
+        const items: MirrorMedia[] = [];
+        for (let idx = 1; idx <= 20; idx++) {
+          const p2 = await Http.getFollow(`https://${host}/${postType}/${code}/?img_index=${idx}`,
+            InstagramService.BOT_UA, '', 3, true);
+          const og2 = InstagramService.metaContent(p2.text, 'og:image');
+          if (og2.length === 0 || og2.indexOf('/grid/') >= 0) {
+            break;
+          }
+          const abs2 = og2.indexOf('/') === 0 ? `https://${host}${og2}` : og2;
+          const pg3 = await Http.getFollow(abs2, InstagramService.BOT_UA, '', 3, true);
+          const d3 = InstagramService.directMediaFromFollow(pg3.finalUrl);
+          if (d3 === null || d3.kind !== 'image') {
+            break;
+          }
+          const d3url: string = d3.url;
+          if (items.some((it: MirrorMedia): boolean => it.url === d3url)) {
+            break;
+          }
+          items.push(d3);
+        }
+        if (items.length > 0) {
+          return InstagramService.buildMirrorResultMulti(items, sourceUrl, title);
+        }
+        return null;
+      }
       const img = await resolve(imageMeta);
       if (img !== null && img.kind === 'image') {
         return InstagramService.buildMirrorResult(img.url, img.url, sourceUrl, title);
@@ -1521,6 +1621,31 @@ export class InstagramService {
     result.mediaItems.push(mi);
     result.workType = mi.type;
     result.coverUrl = isVideo ? poster : url;
+    return result;
+  }
+
+  /** v1.26.5：镜像轮播展开结果打包（多张图片 / 单张也走这里）。 */
+  static buildMirrorResultMulti(items: MirrorMedia[], sourceUrl: string, title: string = ''): ParseResult {
+    const result = new ParseResult();
+    result.platform = Platform.INSTAGRAM;
+    result.sourceUrl = sourceUrl;
+    result.status = ParseStatus.OK;
+    result.title = title.length > 0 ? title : 'Instagram';
+    for (const it of items) {
+      const lower = it.url.toLowerCase();
+      const isVideo = lower.indexOf('.mp4') >= 0 || lower.indexOf('/o1/v/') >= 0;
+      const mi = new MediaItem();
+      mi.url = it.url;
+      mi.type = isVideo ? WorkType.VIDEO : WorkType.IMAGES;
+      result.mediaItems.push(mi);
+    }
+    if (result.mediaItems.length === 0) {
+      result.status = ParseStatus.PARSE_FAILED;
+      result.message = '镜像通道没有可用媒体';
+      return result;
+    }
+    result.workType = result.mediaItems[0].type;
+    result.coverUrl = result.mediaItems[0].type === WorkType.IMAGES ? result.mediaItems[0].url : '';
     return result;
   }
 

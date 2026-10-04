@@ -13,6 +13,7 @@ import { Theme } from '../view/Common';
 import { HomePage, ViewerHost } from './Home';
 import { ParsePage } from './Parse';
 import { MinePage } from './Mine';
+import { DouyinWebResolver } from '../service/DouyinResolver';
 
 const TAB_COUNT: number = 3;
 const BAR_HEIGHT: number = 56;
@@ -181,6 +182,9 @@ struct Index {
       // ── 全窗查看器（v1.19.0 重构）：挂在 Index 根 Stack、盖住 HdsTabs，
       // 彻底脱离 HdsNavigation 内容裁剪——底部小白条区域白条根治 ──
       ViewerHost()
+
+      // ── 抖音隐藏 WebView 解析器（v1.26.5）：直连被风控时兜底，1px 不可见 ──
+      DouyinWebResolver()
 
       // ── 悬浮下载进度胶囊（v1.26.0）：任意页面可见，点击跳解析页任务列表 ──
       if (this.dlActiveCount > 0 && this.viewerIndex < 0) {

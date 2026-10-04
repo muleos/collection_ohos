@@ -2,8 +2,8 @@
   "app": {
     "bundleName": "com.hmos.collection",
     "vendor": "hmos",
-    "versionCode": 1000038,
-    "versionName": "1.26.4",
+    "versionCode": 1000039,
+    "versionName": "1.26.5",
     "icon": "$media:app_icon",
     "label": "$string:app_name"
   }
