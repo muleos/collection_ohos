@@ -714,16 +714,27 @@ export struct MediaViewer {
     this.setStatusBarContent(false);
   }
 
-  /** 状态栏内容反色：查看器黑底用白色图标，退出恢复深色 */
+  /** 状态栏内容反色：查看器黑底用白色图标，退出恢复主题色。
+   *  v1.26.4：补 isStatusBarLightIcon（部分版本只设 contentColor 不生效），
+   *  并在打开/关闭动画后延迟补设一次（动画期间系统可能重设覆盖）。 */
   private async setStatusBarContent(light: boolean): Promise<void> {
-    try {
-      const win = await window.getLastWindow(getContext(this) as common.UIAbilityContext);
-      await win.setWindowSystemBarProperties({
-        statusBarContentColor: light ? '#FFFFFF' : '#000000'
-      });
-    } catch (e) {
-      // 忽略：个别窗口态下设置失败不影响功能
-    }
+    // 深色主题下退出查看器也应恢复白色内容（黑底系统状态栏）
+    const contentLight: boolean = light || this.isDarkMode;
+    const apply = async (): Promise<void> => {
+      try {
+        const win = await window.getLastWindow(getContext(this) as common.UIAbilityContext);
+        await win.setWindowSystemBarProperties({
+          statusBarContentColor: contentLight ? '#FFFFFF' : '#000000',
+          isStatusBarLightIcon: contentLight
+        });
+      } catch (e) {
+        // 忽略：个别窗口态下设置失败不影响功能
+      }
+    };
+    await apply();
+    setTimeout((): void => {
+      apply();
+    }, 250);
   }
 
   private fileUri(path: string): string {
@@ -1195,29 +1206,10 @@ export struct MediaViewer {
 
         Blank()
 
-        // v1.26.0：视频页「在线观看」切换（X/IG 视频远程直链流式播放）
-        // v1.26.2：胶囊底色/文字随深浅色反色——浅色下用深色玻璃+深色字，白底白字不可读修复
-        if (this.item.remoteVideoUrl.length > 0 && this.isVideoPage(this.item.mediaPaths[this.current])) {
-          Row({ space: 6 }) {
-            SymbolGlyph($r('sys.symbol.play_fill'))
-              .fontSize(14)
-              .fontColor([this.playRemote ? Theme.accent : (this.isDarkMode ? '#FFFFFF' : '#E5000000')])
-            Text(this.playRemote ? '正在在线观看，点此切回本地' : '在线观看原始视频')
-              .fontSize(13)
-              .fontColor(this.playRemote ? Theme.accent : (this.isDarkMode ? '#FFFFFF' : '#E5000000'))
-          }
-          .padding({ left: 14, right: 14, top: 8, bottom: 8 })
-          .borderRadius(18)
-          .backgroundColor(this.isDarkMode ? '#66000000' : '#8CFFFFFF')
-          .backgroundBlurStyle(BlurStyle.Regular)
-          .border({ width: 0.5, color: this.isDarkMode ? '#40FFFFFF' : '#33FFFFFF' })
-          .margin({ bottom: 10 })
-          .onClick(() => {
-            this.playRemote = !this.playRemote;
-          })
-        }
+        // v1.26.4：「在线观看原始视频」胶囊按要求隐藏（远程播放能力保留在数据层）
 
         // 底部：原帖文本内容（作者 + 平台图标 + 正文）
+        // v1.26.4：视频页文案抬高避让系统播放条（播放条占位≈视频底边距之上 48vp）
         Column({ space: 6 }) {
           Row({ space: 8 }) {
             Image(badgeRes(this.item.platform))
@@ -1253,7 +1245,9 @@ export struct MediaViewer {
           left: 16,
           right: 16,
           top: 10,
-          bottom: Math.max(this.bottomAvoid, this.bottomInset) + 16
+          // 视频页：播放条底边距(max+8) + 播放条高度(~48) + 间距；图片页维持原值
+          bottom: Math.max(this.bottomAvoid, this.bottomInset) +
+            (this.isVideoPage(this.item.mediaPaths[this.current]) ? 64 : 16)
         })
       }
       .width('100%')

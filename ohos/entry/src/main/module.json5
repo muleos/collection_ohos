@@ -61,9 +61,11 @@
           {
             "actions": ["ohos.want.action.sendData"],
             "uris": [
-              { "scheme": "file", "utd": "general.text" },
-              { "scheme": "file", "utd": "general.plain-text" },
-              { "scheme": "file", "utd": "general.hyperlink" }
+              { "scheme": "file", "utd": "general.text", "maxFileSupported": 1 },
+              { "scheme": "file", "utd": "general.plain-text", "maxFileSupported": 1 },
+              { "scheme": "file", "utd": "general.hyperlink", "maxFileSupported": 1 },
+              { "scheme": "https", "utd": "general.hyperlink", "maxFileSupported": 1 },
+              { "scheme": "http", "utd": "general.hyperlink", "maxFileSupported": 1 }
             ]
           },
           {
