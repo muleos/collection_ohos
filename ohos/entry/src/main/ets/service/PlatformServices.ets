@@ -619,7 +619,10 @@ export class DouyinService {
     // resolve reject（busy/未挂载）不再中断整个解析。
     let webUrl = entry.length > 0 ? entry : url;
     if (id.length > 0) {
-      webUrl = `https://www.iesdouyin.com/share/${DouyinService.postType(sourceUrl.length > 0 ? sourceUrl : url)}/${id}`;
+      // v1.28.0（videdown 同款）：加载 www.douyin.com 桌面页（Chrome UA），
+      // 页面自身 JS 调 detail API、WebView 钩子拦截响应——分享页风控最重，
+      // 桌面页是浏览器正常用户入口，是最稳的取数页面。
+      webUrl = `https://www.douyin.com/${DouyinService.postType(sourceUrl.length > 0 ? sourceUrl : url)}/${id}`;
     }
     let viaWeb = '';
     try {
@@ -638,8 +641,18 @@ export class DouyinService {
     return failed;
   }
 
-  /** WebView 注入脚本返回的 JSON → ParseResult（复用 buildFromAweme 映射）。 */
+  /** WebView 注入脚本返回的 JSON → ParseResult。v1.28.0 起注入可能交付
+   *  detail API 原始 JSON（aweme_detail/item_list 结构）或旧版精简结构，
+   *  依次尝试后兜底。 */
   static fromResolverJson(jsonText: string, sourceUrl: string): ParseResult | null {
+    const api1 = DouyinService.fromAwemeDetail(jsonText, sourceUrl);
+    if (api1 !== null) {
+      return api1;
+    }
+    const api2 = DouyinService.fromItemList(jsonText, sourceUrl);
+    if (api2 !== null) {
+      return api2;
+    }
     try {
       const root = JSON.parse(jsonText) as Record<string, Object>;
       const item: Record<string, Object> = {};
@@ -1862,6 +1875,40 @@ export class InstagramService {
     return out;
   }
 
+  /**
+   * v1.28.0 无代理国内中转：fbcdn/cdninstagram 直链国内不可达（实测超时），
+   * wsrv.nl（Cloudflare 图片代理，国内直连可用，实测 200 image/jpeg）可完整
+   * 中转图片字节流——图片（含轮播/封面）URL 改写为 wsrv 包装，免代理即可
+   * 下载与展示。视频 wsrv 无法中转（实测 404），保持原链（需代理下载）。
+   * 已配置应用代理时直连原链（原图无第三方重压缩）。
+   */
+  static proxiedMediaUrl(url: string): string {
+    if (url.length === 0 || NetProxy.host.length > 0) {
+      return url;
+    }
+    const lower = url.toLowerCase();
+    const isFb = lower.indexOf('fbcdn.net') >= 0 || lower.indexOf('cdninstagram.com') >= 0;
+    if (!isFb || lower.indexOf('.mp4') >= 0 || lower.indexOf('/o1/v/') >= 0) {
+      return url;
+    }
+    return 'https://wsrv.nl/?url=' + encodeURIComponent(url) + '&n=-1';
+  }
+
+  /** 无代理时对解析成功结果统一做 URL 中转改写（parse() 所有 OK 出口调用）。 */
+  static applyNoProxyRelay(result: ParseResult): ParseResult {
+    if (NetProxy.host.length > 0) {
+      return result;
+    }
+    for (const mi of result.mediaItems) {
+      if (mi.type === WorkType.IMAGES) {
+        mi.url = InstagramService.proxiedMediaUrl(mi.url);
+      }
+      mi.posterUrl = InstagramService.proxiedMediaUrl(mi.posterUrl);
+    }
+    result.coverUrl = InstagramService.proxiedMediaUrl(result.coverUrl);
+    return result;
+  }
+
   static async parse(url: string): Promise<ParseResult> {
     const failed = new ParseResult();
     failed.platform = Platform.INSTAGRAM;
@@ -1914,32 +1961,32 @@ export class InstagramService {
       // 免代理：镜像 302 直出真实媒体直链（单图/封面），国内直连可达
       const mirror = await tryMirror();
       if (mirror !== null) {
-        return mirror;
+        return InstagramService.applyNoProxyRelay(mirror);
       }
     } else {
       // 配了代理：App API 优先（v1.26.7 重构）——对数据中心 IP 比
       // 网页通道宽容得多，免登录全量数据（轮播/视频/作者文案）
       const appApi = await tryAppApi();
       if (appApi.status === ParseStatus.OK && appApi.mediaItems.length > 0) {
-        return appApi;
+        return InstagramService.applyNoProxyRelay(appApi);
       }
     }
     // 通道〇b（主）：帖子页 HTML xig_polaris_media（需代理）
     const page = await InstagramService.pageHtmlParse(code, postType);
     if (page.status === ParseStatus.OK && page.mediaItems.length > 0) {
       page.sourceUrl = target;
-      return page;
+      return InstagramService.applyNoProxyRelay(page);
     }
     // 通道一（备）：web graphql（2026-06-29 曾下线，IG 可能轮换恢复，保留兜底）
     const gql = await InstagramService.graphqlParse(code);
     if (gql.status === ParseStatus.OK && gql.mediaItems.length > 0) {
       gql.sourceUrl = target;
-      return gql;
+      return InstagramService.applyNoProxyRelay(gql);
     }
     // 通道一点五：App API（前面没试过时再试）
     const appApi2 = await tryAppApi();
     if (appApi2.status === ParseStatus.OK && appApi2.mediaItems.length > 0) {
-      return appApi2;
+      return InstagramService.applyNoProxyRelay(appApi2);
     }
     // 通道二（备）：embed/captioned 页（v1.26.6 提取为方法 + 双 UA 变体）。
     // 注意新版 embed 页的 JSON 已转义塞进 contextJSON（\"shortcode_media\"
@@ -1947,16 +1994,16 @@ export class InstagramService {
     // 简化 embed 常常仍可用。
     const embed = await InstagramService.embedParse(code, postType, target);
     if (embed.status === ParseStatus.OK && embed.mediaItems.length > 0) {
-      return embed;
+      return InstagramService.applyNoProxyRelay(embed);
     }
     // 通道三：instagram.com 系全败——镜像通道兜底（免代理仍可出照片第一张）
     const mirror2 = await tryMirror();
     if (mirror2 !== null) {
-      return mirror2;
+      return InstagramService.applyNoProxyRelay(mirror2);
     }
     if (!hasProxy) {
       failed.message = 'Instagram 解析失败：未配置代理，视频与多图作品无法获取' +
-        '（镜像站仅能取到单张照片）。请在「设置 → 网络」配置代理（如 127.0.0.1:7890）并开启「代理下载」后重试';
+        '（图片经国内中转可下载，视频直链必须代理）。请在「设置 → 网络」配置代理（如 127.0.0.1:7890）并开启「代理下载」后重试';
     } else {
       failed.message = 'Instagram 解析失败（代理通道被登录墙拦截或作品需登录）。' +
         '可尝试更换代理节点后重试，或改用「网页提取」';

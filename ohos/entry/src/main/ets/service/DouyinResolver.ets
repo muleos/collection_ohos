@@ -1,27 +1,116 @@
 /**
- * 抖音 WebView 解析器（v1.26.6，SaveAny DouyinWebResolver 同构）
+ * 抖音 WebView 解析器（v1.28.0，videdown puppeteer 方案同构）
  *
- * 直连通道已被抖音 JS 挑战壳拦截（分享页返回空 body + jsvmp 混淆脚本，
- * _ROUTER_DATA 不再出现在首屏 HTML），WebView 内核执行挑战脚本跳到真实
- * 页面后仍能拿到完整作品数据——这是直连失败后的唯一兜底通道。
- *
- * v1.26.6 修复（解析仍全败的根因）：
- * 1. Web 组件此前 .visibility(Hidden) 不参与渲染，WebView 可能不加载页面
- *    /不执行挑战 JS——改为渲染在屏外（position 屏外 + opacity 0.01）。
- * 2. 注入此前只在 onPageEnd 后执行一次，挑战跳转/异步数据未就绪时取空——
- *    改为多轮重试注入（每轮失败后 1.4s 再试，页面每次跳转重置计数，
- *    最多 8 次或拿到有效数据为止），由桥统一幂等交付。
- * 3. 服务层 resolve reject（busy/未挂载）此前未捕获会中断整个解析——
- *    调用侧已改为 try-catch。
+ * v1.28.0 重构（多轮"解析失败"的最终修复）：
+ * 此前加载的是 iesdouyin 分享页 + iOS UA——分享页是风控最重的入口，
+ * 挑战壳之后数据也不保证回归。videdown 在桌面端能稳定工作的核心是：
+ * 加载 www.douyin.com 桌面页（Chrome UA），页面自身 JS 会调
+ * /aweme/v1/web/aweme/detail/ 拉数据，无头浏览器只需"监听"该 API 响应。
+ * ArkWeb 等价实现：
+ * 1. javaScriptOnDocumentStart 注入 fetch/XHR 钩子——页面自己发的
+ *    detail API 响应被捕获进 window.__DY_API__（等价 puppeteer 的
+ *    page.on('response') 网络拦截，最难被封的取数方式）。
+ * 2. 加载 https://www.douyin.com/{video|note|slides}/{id} 桌面页 + 桌面
+ *    Chrome UA；轮询读 __DY_API__ → _SSR_HYDRATED_DATA/__INITIAL_STATE__
+ *    （videdown 同款 SSR 水合探查）→ _ROUTER_DATA → DOM video src。
+ * 3. 注入时若数据未就绪，顺手点一下播放按钮触发视频加载（videdown 同款）。
  */
 import { webview } from '@kit.ArkWeb';
 
-/** 通用移动端 UA（iOS Safari，与直连通道一致）。 */
-const RESOLVER_UA: string = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 ' +
-  '(KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1';
+/** 桌面 Chrome UA（www.douyin.com 桌面页用，videdown 同款）。 */
+const RESOLVER_UA: string = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-/** 注入脚本：优先读运行时 _ROUTER_DATA，备用 DOM/ld+json 兜底。 */
+/**
+ * document-start 注入：hook fetch/XHR，捕获页面自身发出的 detail API 响应
+ * 存入 window.__DY_API__（幂等，挑战跳转后的每个文档重新安装）。
+ */
+const HOOK_JS: string = `(function () {
+  if (window.__DY_HOOK__) { return; }
+  window.__DY_HOOK__ = true;
+  window.__DY_API__ = '';
+  function dyCapture(u, body) {
+    try {
+      if (!u || !body) { return; }
+      var s = String(u);
+      if (s.indexOf('/aweme/v1/web/aweme/detail/') < 0 &&
+        s.indexOf('/aweme/v1/multi/aweme/detail/') < 0 &&
+        s.indexOf('/aweme/v1/aweme/detail/') < 0 &&
+        s.indexOf('iteminfo') < 0 && s.indexOf('/aweme/v1/feed/') < 0) { return; }
+      var b = String(body);
+      if (b.length > 100 && (b.indexOf('aweme_detail') >= 0 || b.indexOf('item_list') >= 0)) {
+        window.__DY_API__ = b;
+      }
+    } catch (e) {}
+  }
+  try {
+    var of = window.fetch;
+    if (of) {
+      window.fetch = function () {
+        var args = arguments;
+        var u = '';
+        try { u = (args[0] && args[0].url) ? String(args[0].url) : String(args[0]); } catch (e) {}
+        return of.apply(this, args).then(function (resp) {
+          try {
+            var c = resp.clone();
+            if (c && c.text) { c.text().then(function (t) { dyCapture(u, t); }).catch(function () {}); }
+          } catch (e) {}
+          return resp;
+        });
+      };
+    }
+  } catch (fe) {}
+  try {
+    var oOpen = XMLHttpRequest.prototype.open;
+    var oSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (m, u) {
+      try { this.__dyu = String(u); } catch (e) {}
+      return oOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function () {
+      var self = this;
+      try {
+        this.addEventListener('readystatechange', function () {
+          if (self.readyState === 4) { try { dyCapture(self.__dyu, self.responseText); } catch (e) {} }
+        });
+      } catch (e) {}
+      return oSend.apply(this, arguments);
+    };
+  } catch (xe) {}
+})();`;
+
+/** document-start 脚本项（SDK 11+ 要求 ScriptItem[] + 作用域规则）。 */
+const HOOK_ITEMS: ScriptItem[] = [
+  { script: HOOK_JS, scriptRules: ['*://*.douyin.com/*', '*://*.iesdouyin.com/*'] }
+];
+
+/** 注入脚本：① document-start 钩子捕获的 detail API 原始 JSON →
+ *  ② SSR 水合数据（videdown 同款探查）→ ③ _ROUTER_DATA → ④ DOM/ld+json。 */
 const RESOLVER_JS: string = `(function () {
+  try {
+    var cap = window.__DY_API__;
+    if (cap && cap.length > 100 && (cap.indexOf('aweme_detail') >= 0 || cap.indexOf('item_list') >= 0)) {
+      return cap;
+    }
+  } catch (capError) {}
+  try {
+    var ssr = window._SSR_HYDRATED_DATA;
+    var sDetail = null;
+    if (ssr) {
+      sDetail = ssr.aweme_detail || (ssr.aweme && ssr.aweme.aweme_detail) ||
+        (ssr.app && ssr.app.aweme_detail) || (ssr.aweme && ssr.aweme.detail);
+    }
+    if (!sDetail) {
+      var st = window.__INITIAL_STATE__;
+      if (st) {
+        sDetail = st.aweme_detail || (st.aweme && st.aweme.aweme_detail) ||
+          (st.app && st.app.aweme_detail);
+      }
+    }
+    if (sDetail && (sDetail.video || sDetail.images || sDetail.desc)) {
+      return JSON.stringify({ aweme_detail: sDetail });
+    }
+  } catch (ssrError) {}
   var mediaElements = document.querySelectorAll('video, audio');
   for (var mediaIndex = 0; mediaIndex < mediaElements.length; mediaIndex++) {
     try {
@@ -207,6 +296,10 @@ const RESOLVER_JS: string = `(function () {
   }
   if (title.length === 0 || (isImagePost && images.length === 0) ||
     (!isImagePost && videoUrl.length === 0)) {
+    try {
+      var playBtn = document.querySelector('.play-button, [data-e2e="play-button"], .player-play, .video-play');
+      if (playBtn && playBtn.click) { playBtn.click(); }
+    } catch (clickError) {}
     return '{}';
   }
   if (author.length === 0) {
@@ -227,7 +320,7 @@ const RESOLVER_JS: string = `(function () {
 })();`;
 
 /** 单次解析的注入尝试上限与间隔（挑战跳转后每次 onPageEnd 重置）。 */
-const MAX_ATTEMPTS: number = 10;
+const MAX_ATTEMPTS: number = 14;
 const RETRY_DELAY_MS: number = 1400;
 /** 解析总超时：挑战跳转 + 异步数据可能超过 30s。 */
 const RESOLVE_TIMEOUT_MS: number = 45000;
@@ -381,6 +474,7 @@ export struct DouyinWebResolver {
       .multiWindowAccess(false)
       .zoomAccess(false)
       .userAgent(RESOLVER_UA)
+      .javaScriptOnDocumentStart(HOOK_ITEMS)
       .onControllerAttached(() => {
         this.ready = true;
         if (this.pendingUrl.length > 0) {
