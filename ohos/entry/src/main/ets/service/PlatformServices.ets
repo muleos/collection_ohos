@@ -1634,11 +1634,11 @@ export class InstagramService {
           if (u.length > 0) {
             const mi2 = new MediaItem();
             mi2.url = u;
-            mi2.type = WorkType.IMAGE;
+            mi2.type = WorkType.IMAGES;
             result.mediaItems.push(mi2);
           }
         }
-        result.workType = result.mediaItems.length > 1 ? WorkType.IMAGES : WorkType.IMAGE;
+        result.workType = WorkType.IMAGES;
       }
       if (result.mediaItems.length === 0) {
         return null;
