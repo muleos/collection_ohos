@@ -1728,6 +1728,56 @@ export class MediaParser {
     if (input === null || input.length === 0) {
       return out;
     }
+    // 尾部标点裁剪
+    const trimJunk = (raw: string): string => {
+      let end = raw.length;
+      const junk = ')]}.,;!，。）】、；：';
+      while (end > 0 && junk.indexOf(raw[end - 1]) >= 0) {
+        end--;
+      }
+      return raw.substring(0, end);
+    };
+    const push = (link: string): void => {
+      if (link.length > 0 && link.indexOf('/') >= 0 && out.indexOf(link) < 0) {
+        out.push(link);
+      }
+    };
+    // v1.26.0 精准提取：各平台严格白名单正则优先（X 必须是 status 帖子、
+    // IG 必须是 p/reel/tv/share 路径），避免把个人主页/无关链接混进批量解析
+    const strict: RegExp[] = [
+      // X / Twitter：/user/status(es)/id（含 photo 子路径与查询参数）
+      /(?:https?:\/\/)?(?:www\.|mobile\.)?(?:x|twitter)\.com\/[A-Za-z0-9_]{1,20}\/status(?:es)?\/\d+(?:\/photo\/\d+)?(?:\?[^\s"'<>，。；！？、【】《》\\^`{|}]*)?/gi,
+      // X 短链 t.co（解析服务里跟跳还原）
+      /(?:https?:\/\/)?t\.co\/[A-Za-z0-9]{5,}/gi,
+      // Instagram：p / reel(s) / tv / share 短链路径
+      /(?:https?:\/\/)?(?:[A-Za-z0-9-]+\.)*instagram\.com\/(?:p|reel|reels|tv|share)\/[A-Za-z0-9_-]+(?:\/photo)?(?:\/?[^\s"'<>，。；！？、【】《》\\^`{|}]*)?/gi,
+      // Instagram 短链 instagr.am
+      /(?:https?:\/\/)?instagr\.am\/(?:p|reel|reels|tv|share)\/[A-Za-z0-9_-]+(?:\/?[^\s"'<>，。；！？、【】《》\\^`{|}]*)?/gi,
+      // 小红书 / rednote
+      /(?:https?:\/\/)?(?:[A-Za-z0-9-]+\.)*(?:xiaohongshu\.com|rednote\.com)\/[^\s"'<>，。；！？、【】《》\\^`{|}]+/gi,
+      /(?:https?:\/\/)?[A-Za-z0-9-]+\.?xhslink\.(?:com|cn)\/[^\s"'<>，。；！？、【】《》\\^`{|}]+/gi,
+      // 抖音
+      /(?:https?:\/\/)?(?:[A-Za-z0-9-]+\.)*(?:douyin\.com|iesdouyin\.com)\/[^\s"'<>，。；！？、【】《》\\^`{|}]+/gi,
+      // TikTok
+      /(?:https?:\/\/)?(?:www\.|vm\.|vt\.)?tiktok\.com\/[^\s"'<>，。；！？、【】《》\\^`{|}]+/gi,
+      // B站 / b23 短链
+      /(?:https?:\/\/)?(?:www\.|m\.)?bilibili\.com\/[^\s"'<>，。；！？、【】《》\\^`{|}]+/gi,
+      /(?:https?:\/\/)?b23\.tv\/[A-Za-z0-9]+/gi
+    ];
+    for (const re of strict) {
+      let m: RegExpExecArray | null = re.exec(input);
+      while (m !== null) {
+        const raw0 = m[0];
+        const preceding = m.index > 0 ? input[m.index - 1] : '';
+        const isWordish = (preceding >= 'a' && preceding <= 'z') ||
+          (preceding >= 'A' && preceding <= 'Z') || (preceding >= '0' && preceding <= '9');
+        if (!isWordish) {
+          push(trimJunk(raw0));
+        }
+        m = re.exec(input);
+      }
+    }
+    // 通用兜底：白名单没覆盖的其它链接（含裸域名无 scheme），保持旧行为
     const regex = /(?:https?:\/\/)?(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?:\/[^\s"'<>，。；！？、【】《》\\^`{|}，]*)?/gi;
     let match: RegExpExecArray | null = regex.exec(input);
     while (match !== null) {
@@ -1738,16 +1788,7 @@ export class MediaParser {
         (preceding >= 'A' && preceding <= 'Z') || (preceding >= '0' && preceding <= '9') ||
         preceding === '.' || preceding === '_' || preceding === '-';
       if (!isWordish) {
-        let end = raw0.length;
-        const junk = ')]}.,;!，。）】';
-        while (end > 0 && junk.indexOf(raw0[end - 1]) >= 0) {
-          end--;
-        }
-        const link = raw0.substring(0, end);
-        // 必须带路径（分享链接都有），排除 "xiaohongshu.com" 之类裸域名
-        if (link.indexOf('/') >= 0) {
-          out.push(link);
-        }
+        push(trimJunk(raw0));
       }
       match = regex.exec(input);
     }

@@ -100,6 +100,56 @@ export class DownloadQueue {
     for (const listener of this.listeners) {
       listener(state);
     }
+    this.publishProgress();
+    this.refreshBackground();
+  }
+
+  /**
+   * 全局进度广播（v1.26.0）：活跃任务数与聚合进度写入 AppStorage，
+   * Index 悬浮进度胶囊据此显示，任意页面可见、点击跳解析页任务列表。
+   */
+  private publishProgress(): void {
+    let active = 0;
+    let sum = 0;
+    for (const task of this.store.all()) {
+      if (task.status === TaskStatus.DOWNLOADING || task.status === TaskStatus.RESOLVING ||
+        task.status === TaskStatus.QUEUED) {
+        active++;
+        sum += task.progress;
+      }
+    }
+    AppStorage.setOrCreate<number>('dlActiveCount', active);
+    AppStorage.setOrCreate<number>('dlProgressPercent', active > 0 ? Math.floor(sum / active) : 0);
+  }
+
+  /**
+   * 后台连续任务统一管理（v1.26.0）：小红书 drain 与多平台任务任一在跑
+   * 就持有 DATA_TRANSFER 连续任务——应用切后台/锁屏下载不中断。
+   */
+  private bgHeld: boolean = false;
+
+  private hasActiveWork(): boolean {
+    if (this.draining) {
+      return true;
+    }
+    for (const task of this.store.all()) {
+      if (task.noteType === 'multi' && (task.status === TaskStatus.DOWNLOADING ||
+        task.status === TaskStatus.RESOLVING || task.status === TaskStatus.QUEUED)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private refreshBackground(): void {
+    const need = this.hasActiveWork();
+    if (need && !this.bgHeld) {
+      this.bgHeld = true;
+      this.startBackground();
+    } else if (!need && this.bgHeld) {
+      this.bgHeld = false;
+      this.stopBackground();
+    }
   }
 
   /** Enqueue raw share text (single or multi-link). */
@@ -218,6 +268,7 @@ export class DownloadQueue {
       cur1.status = TaskStatus.DOWNLOADING;
       this.store.touch(cur1);
       this.notify();
+      let lastDone = 0;
       const result = await AppContainer.get().multi.saveParsed(parsed, this.requireContext(),
         (): void => {
         },
@@ -227,9 +278,21 @@ export class DownloadQueue {
             return false;
           }
           cur.completedFiles = done;
+          lastDone = done;
           cur.progress = total > 0 ? Math.floor(done * 100 / total) : 0;
           this.notifyThrottled();
           return true;
+        },
+        // 字节级进度：当前文件 received/total 折算进任务总进度（不超 99，完成由 onStep 收口）
+        (received: number, total: number): void => {
+          const cur = this.store.byId(taskId);
+          if (cur === null || total <= 0 || cur.totalFiles <= 0) {
+            return;
+          }
+          const frac = Math.min(1, received / total);
+          const overall = Math.floor(((lastDone + frac) * 100) / cur.totalFiles);
+          cur.progress = Math.min(overall, 99);
+          this.notifyThrottled();
         });
       if (result.ok) {
         finish(TaskStatus.COMPLETED, '', parsed.mediaItems.length, parsed.mediaItems.length);
@@ -412,7 +475,9 @@ export class DownloadQueue {
     } finally {
       this.draining = false;
       this.lastSpeed = 0;
-      await this.stopBackground();
+      // v1.26.0：多平台任务仍在跑时不能释放连续任务（原来无条件 stop 会
+      // 在小红书队列跑完后把还在下载的 X/IG 任务断网）
+      this.refreshBackground();
       this.notify();
     }
   }

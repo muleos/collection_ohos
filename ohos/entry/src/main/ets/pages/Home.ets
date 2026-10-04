@@ -667,6 +667,8 @@ export struct MediaViewer {
   /** 单击切换顶部/底部操作条显隐（VHome 同款） */
   @State showControls: boolean = true;
   @State saving: boolean = false;
+  /** v1.26.0：当前视频页用远程直链在线观看（X/IG 视频）而非本地文件 */
+  @State playRemote: boolean = false;
   /** 捏合起点快照（倍率 + 平移 + 双指焦点） */
   private pinchBaseScale: number = 1;
   private pinchBasePanX: number = 0;
@@ -1059,8 +1061,10 @@ export struct MediaViewer {
           ForEach(this.item.mediaPaths, (p: string, pageIdx: number) => {
             Stack() {
               if (this.isVideoPage(p)) {
-                Video({ src: this.fileUri(p) })
+                Video({ src: this.playRemote && this.item.remoteVideoUrl.length > 0 ?
+                  this.item.remoteVideoUrl : this.fileUri(p) })
                   .controls(true)
+                  .autoPlay(this.playRemote)
                   .width('100%')
                   .height('100%')
                   .objectFit(ImageFit.Contain)
@@ -1157,6 +1161,27 @@ export struct MediaViewer {
         .padding({ left: 16, right: 16, top: this.topAvoid + 10 })
 
         Blank()
+
+        // v1.26.0：视频页「在线观看」切换（X/IG 视频远程直链流式播放）
+        if (this.item.remoteVideoUrl.length > 0 && this.isVideoPage(this.item.mediaPaths[this.current])) {
+          Row({ space: 6 }) {
+            SymbolGlyph($r('sys.symbol.play_fill'))
+              .fontSize(14)
+              .fontColor([this.playRemote ? Theme.accent : '#FFFFFF'])
+            Text(this.playRemote ? '正在在线观看，点此切回本地' : '在线观看原始视频')
+              .fontSize(13)
+              .fontColor(this.playRemote ? Theme.accent : '#FFFFFF')
+          }
+          .padding({ left: 14, right: 14, top: 8, bottom: 8 })
+          .borderRadius(18)
+          .backgroundColor('#66FFFFFF')
+          .backgroundBlurStyle(BlurStyle.Regular)
+          .border({ width: 0.5, color: '#40FFFFFF' })
+          .margin({ bottom: 10 })
+          .onClick(() => {
+            this.playRemote = !this.playRemote;
+          })
+        }
 
         // 底部：原帖文本内容（作者 + 平台图标 + 正文）
         Column({ space: 6 }) {

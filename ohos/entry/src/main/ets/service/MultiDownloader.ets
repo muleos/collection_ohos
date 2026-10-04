@@ -13,8 +13,12 @@ import { SavedStore } from '../data/SavedStore';
 import { RecordStore } from '../data/RecordStore';
 import { DownloadRecord } from '../core/models';
 
-export class MultiDownloadResult {
-  ok: boolean = false;
+/** 闭包宿主：流式下载期间持有首块魔数（ArkTS 禁用未类型化对象字面量）。 */
+class Sniffer {
+  head: Uint8Array | null = null;
+}
+
+export class MultiDownloadResult {  ok: boolean = false;
   message: string = '';
   itemId: string = '';
   /** 直连被风控：建议改用网页内核提取。 */
@@ -64,7 +68,8 @@ export class MultiDownloader {
    * （下载任务列表的取消/暂停依赖此钩子）；中止时已下载文件仍会入库。
    */
   async saveParsed(parsed: ParseResult, context: Context, onProgress: (text: string) => void,
-    onStep?: (done: number, total: number) => boolean): Promise<MultiDownloadResult> {
+    onStep?: (done: number, total: number) => boolean,
+    onFileBytes?: (received: number, total: number) => void): Promise<MultiDownloadResult> {
     const out = new MultiDownloadResult();
     if (parsed.mediaItems.length === 0) {
       out.message = '没有可下载的媒体';
@@ -125,7 +130,9 @@ export class MultiDownloader {
       const isVideo = media.type === WorkType.VIDEO;
       const ext = isVideo ? 'mp4' : 'jpg';
       const name = MultiDownloader.buildFileName(item, done, ext);
-      const path = await MultiDownloader.downloadTo(media.url, dir, name);
+      // 字节级进度回调（当前文件 received/total）
+      const bytesHook = onFileBytes !== undefined ? onFileBytes : undefined;
+      const path = await MultiDownloader.downloadTo(media.url, dir, name, bytesHook);
       if (path.length === 0) {
         continue;
       }
@@ -142,6 +149,15 @@ export class MultiDownloader {
         item.coverPath = path;
       }
       done++;
+    }
+    // 记录首个视频的原始直链：查看器「在线观看」流式播放用（X/IG 视频直链与文件同源）
+    if (item.remoteVideoUrl.length === 0) {
+      for (const media of parsed.mediaItems) {
+        if (media.type === WorkType.VIDEO && media.url.length > 0) {
+          item.remoteVideoUrl = media.url;
+          break;
+        }
+      }
     }
     // 任务被取消/暂停：已下载的文件仍入库，返回取消语义
     if (aborted) {
@@ -314,29 +330,141 @@ export class MultiDownloader {
     }
   }
 
-  private static async downloadTo(url: string, dir: string, fileName: string): Promise<string> {
+  /**
+   * 流式下载（v1.26.0）：requestInStream 边收边写盘，替代旧「整包读进内存」。
+   * 旧实现对几十 MB 的 X/IG 视频会内存暴涨 + readTimeout 超时 → 下载必失败；
+   * 流式同时支撑字节级下载进度（dataReceiveProgress）。
+   * 失败时回退旧的整包缓冲（小图场景仍可靠）。
+   */
+  private static async downloadTo(url: string, dir: string, fileName: string,
+    onBytes?: (received: number, total: number) => void): Promise<string> {
+    const streamed = await MultiDownloader.downloadStream(url, dir, fileName, onBytes);
+    if (streamed.length > 0) {
+      return streamed;
+    }
+    return MultiDownloader.downloadBuffered(url, dir, fileName);
+  }
+
+  private static baseHeaders(url: string): Record<string, string> {
+    const header: Record<string, string> = {
+      'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 ' +
+        '(KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1',
+      'Accept': '*/*'
+    };
+    const referer = MultiDownloader.refererFor(url);
+    if (referer.length > 0) {
+      header['Referer'] = referer;
+    }
+    return header;
+  }
+
+  private static baseOptions(url: string, method: http.RequestMethod): http.HttpRequestOptions {
+    return {
+      method: method,
+      header: MultiDownloader.baseHeaders(url),
+      usingCache: false,
+      // X/IG 等海外 CDN 需要代理才能下载（设置页「代理下载」开关）
+      usingProxy: NetProxy.option(),
+      connectTimeout: 15000,
+      readTimeout: 120000
+    };
+  }
+
+  private static async downloadStream(url: string, dir: string, fileName: string,
+    onBytes?: (received: number, total: number) => void): Promise<string> {
+    let req: http.HttpRequest | null = null;
+    let file: fileIo.File | null = null;
+    try {
+      req = http.createHttp();
+      const path = dir + '/' + fileName;
+      file = fileIo.openSync(path, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE |
+        fileIo.OpenMode.TRUNC);
+      // 魔数嗅探用首块（闭包内赋值，宿主对象持有避免 TS 收窄为 never）
+      const sniffer = new Sniffer();
+      let serverTotal = 0;
+      const done = new Promise<boolean>((resolve: (v: boolean) => void) => {
+        let failed = false;
+        req!.on('headersReceive', (headers: Object) => {
+          try {
+            const rec = headers as Record<string, Object>;
+            const len = rec['content-length'];
+            if (typeof len === 'string') {
+              serverTotal = parseInt(len);
+            } else if (typeof len === 'number') {
+              serverTotal = len as number;
+            }
+          } catch (e) {
+          }
+        });
+        req!.on('dataReceive', (chunk: ArrayBuffer) => {
+          if (chunk.byteLength <= 0) {
+            return;
+          }
+          try {
+            if (sniffer.head === null) {
+              sniffer.head = new Uint8Array(chunk.slice(0, Math.min(16, chunk.byteLength)));
+            }
+            fileIo.writeSync(file!.fd, chunk);
+          } catch (e) {
+            failed = true;
+          }
+        });
+        req!.on('dataEnd', () => {
+          resolve(!failed);
+        });
+        req!.on('dataReceiveProgress', (data: http.DataReceiveProgressInfo) => {
+          if (onBytes !== undefined && data.totalSize > 0) {
+            onBytes(data.receiveSize, data.totalSize);
+          }
+        });
+      });
+      const opt = MultiDownloader.baseOptions(url, http.RequestMethod.GET);
+      // requestInStream 的返回值就是响应码（number）
+      const code = await req.requestInStream(url, opt);
+      if (code < 200 || code >= 300) {
+        throw new Error('HTTP ' + code);
+      }
+      const ok = await Promise.race([done,
+        new Promise<boolean>((resolve: (v: boolean) => void) => {
+          setTimeout(() => resolve(false), 5000);
+        })]);
+      if (!ok) {
+        throw new Error('stream incomplete');
+      }
+      fileIo.closeSync(file.fd);
+      file = null;
+      req.destroy();
+      req = null;
+      const sniff = sniffer.head as Uint8Array | null;
+      if (sniff === null) {
+        return '';
+      }
+      return MultiDownloader.fixExtension(path, sniff.buffer as ArrayBuffer);
+    } catch (e) {
+      if (file !== null) {
+        try {
+          fileIo.closeSync(file.fd);
+        } catch (e2) {
+        }
+      }
+      if (req !== null) {
+        req.off('dataReceive');
+        req.off('dataEnd');
+        req.off('dataReceiveProgress');
+        req.off('headersReceive');
+        req.destroy();
+      }
+      return '';
+    }
+  }
+
+  /** 旧整包缓冲下载（小文件兜底）。 */
+  private static async downloadBuffered(url: string, dir: string, fileName: string): Promise<string> {
     let req: http.HttpRequest | null = null;
     try {
       req = http.createHttp();
-      const header: Record<string, string> = {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 ' +
-          '(KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1',
-        'Accept': '*/*'
-      };
-      const referer = MultiDownloader.refererFor(url);
-      if (referer.length > 0) {
-        header['Referer'] = referer;
-      }
-      const opt: http.HttpRequestOptions = {
-        method: http.RequestMethod.GET,
-        header: header,
-        expectDataType: http.HttpDataType.ARRAY_BUFFER,
-        usingCache: false,
-        // X/IG 等海外 CDN 需要代理才能下载（设置页「代理下载」开关）
-        usingProxy: NetProxy.option(),
-        connectTimeout: 15000,
-        readTimeout: 120000
-      };
+      const opt = MultiDownloader.baseOptions(url, http.RequestMethod.GET);
+      opt.expectDataType = http.HttpDataType.ARRAY_BUFFER;
       const resp = await req.request(url, opt);
       req.destroy();
       if (resp.responseCode >= 200 && resp.responseCode < 300) {

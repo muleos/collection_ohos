@@ -32,6 +32,10 @@ struct Index {
   @StorageLink('viewerIndex') viewerIndex: number = -1;
   @StorageLink('bottomAvoid') bottomAvoid: number = 0;
   @State currentTab: number = 0;
+  /** 活跃下载任务数（DownloadQueue.publishProgress 广播），>0 显示悬浮进度胶囊 */
+  @StorageProp('dlActiveCount') dlActiveCount: number = 0;
+  /** 聚合下载进度（0-100） */
+  @StorageProp('dlProgressPercent') dlProgress: number = 0;
   /** 其它页面的切页请求（首页解析圆钮 → 解析页），-1 表示无请求 */
   @StorageProp('tabRequest') @Watch('onTabRequest') tabRequest: number = -1;
   /** 三个页签的样式对象（主题色变化时整体重建） */
@@ -177,6 +181,44 @@ struct Index {
       // ── 全窗查看器（v1.19.0 重构）：挂在 Index 根 Stack、盖住 HdsTabs，
       // 彻底脱离 HdsNavigation 内容裁剪——底部小白条区域白条根治 ──
       ViewerHost()
+
+      // ── 悬浮下载进度胶囊（v1.26.0）：任意页面可见，点击跳解析页任务列表 ──
+      if (this.dlActiveCount > 0 && this.viewerIndex < 0) {
+        Column() {
+          Row({ space: 10 }) {
+          Progress({ value: this.dlProgress, total: 100, type: ProgressType.Ring })
+            .width(22)
+            .height(22)
+            .color(Theme.accent)
+            .style({ strokeWidth: 3.5 })
+            Text(this.dlActiveCount > 1 ?
+              `${this.dlActiveCount} 个任务下载中 ${this.dlProgress}%` :
+              `下载中 ${this.dlProgress}%`)
+              .fontSize(13)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(Theme.textPrimary)
+              .maxLines(1)
+            SymbolGlyph($r('sys.symbol.chevron_right'))
+              .fontSize(13)
+              .fontColor([Theme.textSecondary])
+          }
+          .padding({ left: 14, right: 12, top: 9, bottom: 9 })
+          .borderRadius(24)
+          .backgroundColor(Theme.glassBg)
+          .backgroundBlurStyle(BlurStyle.Regular)
+          .border({ width: 0.5, color: Theme.glassBorder })
+          .shadow({ radius: 16, color: 'rgba(0,0,0,0.12)', offsetY: 4 })
+          .alignItems(VerticalAlign.Center)
+          .onClick(() => {
+            AppStorage.setOrCreate<number>('tabRequest', 1);
+          })
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Center)
+        .position({ x: 0, y: '100%' })
+        .translate({ y: -(this.bottomAvoid + BAR_BOTTOM_MARGIN + BAR_HEIGHT + 10) })
+        .hitTestBehavior(HitTestMode.Default)
+      }
     }
     .width('100%')
     .height('100%')

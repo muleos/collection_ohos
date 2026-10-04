@@ -64,6 +64,8 @@ export class SavedItem {
   mediaPaths: string[] = [];
   width: number = 0;
   height: number = 0;
+  /** 解析到的原始视频直链（X/IG 等海外平台）：查看器「在线观看」流式播放用。 */
+  remoteVideoUrl: string = '';
 
   hasMedia(): boolean {
     return this.mediaPaths.length > 0;
@@ -89,7 +91,8 @@ export class SavedItem {
       'coverPath': this.coverPath,
       'mediaPaths': this.mediaPaths as Object,
       'width': this.width as Object,
-      'height': this.height as Object
+      'height': this.height as Object,
+      'remoteVideoUrl': this.remoteVideoUrl
     };
     return JSON.stringify(payload);
   }
@@ -116,6 +119,7 @@ export class SavedItem {
       }
       item.width = typeof o['width'] === 'number' ? o['width'] as number : 0;
       item.height = typeof o['height'] === 'number' ? o['height'] as number : 0;
+      item.remoteVideoUrl = typeof o['remoteVideoUrl'] === 'string' ? o['remoteVideoUrl'] as string : '';
       return item;
     } catch (e) {
       return null;
