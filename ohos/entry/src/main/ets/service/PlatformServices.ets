@@ -10,9 +10,9 @@ import { DouyinResolverBridge } from './DouyinResolver';
 const IOS_UA: string = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 ' +
   '(KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1';
 
-/** 桌面 Chrome UA（快手 GraphQL / B站 playurl / 抖音 web detail 等 PC web 接口用）。 */
+/** 桌面 Chrome UA（快手 GraphQL / B站 playurl / 抖音 web detail 等 PC web 接口用；v1.28.1 升 131）。 */
 const CHROME_UA: string = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 /**
  * 海外平台代理桥：设置页「代理」（host:port）+「代理下载」开关 →
@@ -643,8 +643,38 @@ export class DouyinService {
 
   /** WebView 注入脚本返回的 JSON → ParseResult。v1.28.0 起注入可能交付
    *  detail API 原始 JSON（aweme_detail/item_list 结构）或旧版精简结构，
-   *  依次尝试后兜底。 */
-  static fromResolverJson(jsonText: string, sourceUrl: string): ParseResult | null {
+   *  依次尝试后兜底。
+   *  v1.28.1 关键修复：ArkWeb runJavaScript 返回的是脚本求值结果的
+   *  JSON 序列化——脚本返回字符串时结果带外层引号与内部转义
+   *  （"{\"desc\":...}"）。直接 JSON.parse 得到的是 string 而非对象，
+   *  三条解析路径全部落空（数据其实抓到了）——这就是 v1.28.0 WebView
+   *  通道"注入成功仍解析失败"的根因。此处先归一化再分发。 */
+  static fromResolverJson(rawText: string, sourceUrl: string): ParseResult | null {
+    let jsonText = rawText.trim();
+    if (jsonText.length > 1 && jsonText.charAt(0) === '"' && jsonText.charAt(jsonText.length - 1) === '"') {
+      try {
+        const decoded = JSON.parse(jsonText) as string;
+        if (typeof decoded === 'string' && decoded.trim().charAt(0) === '{') {
+          jsonText = decoded.trim();
+        }
+      } catch (e) {
+        // 外层引号但非法 JSON：保持原样，让后续路径报错
+      }
+    }
+    // 防御：结果仍可能是二次编码的字符串（多层引号），循环解开
+    let guard = 0;
+    while (jsonText.length > 1 && jsonText.charAt(0) === '"' && jsonText.charAt(jsonText.length - 1) === '"' && guard < 3) {
+      try {
+        const decoded = JSON.parse(jsonText) as string;
+        if (typeof decoded !== 'string' || decoded.trim().charAt(0) !== '{') {
+          break;
+        }
+        jsonText = decoded.trim();
+        guard++;
+      } catch (e) {
+        break;
+      }
+    }
     const api1 = DouyinService.fromAwemeDetail(jsonText, sourceUrl);
     if (api1 !== null) {
       return api1;
@@ -1320,10 +1350,12 @@ export class InstagramService {
   static readonly IG_APP_UA: string = 'Instagram 276.0.0.26.103 Android (33/13; 420dpi; 1080x2400; ' +
     'samsung; SM-G991B; o1s; qcom; en_US; 447193818)';
   static readonly IG_APP_ID: string = '936619743392459';
-  /** 镜像实例列表（instagramez 已验证被广告劫持，不采用）。 */
+  /** 镜像实例列表（instagramez 已验证被广告劫持，不采用）。
+   *  v1.28.1：补裸域变体——www 子域与裸域是两条解析路径，单一实例 504
+   *  （2026-10-04 实测 www.kkinstagram.com 全量 504）时不至于全灭。 */
   // v1.26.6 实测：vxinstagram 对所有请求 401（实例已死）、gginstagram 证书坏、
-  // ddinstagram 国内直连不可达——公共实例仅剩 kkinstagram 可用。
-  static readonly MIRROR_HOSTS: string[] = ['www.kkinstagram.com'];
+  // ddinstagram 国内直连不可达——公共实例仅剩 kkinstagram 系可用。
+  static readonly MIRROR_HOSTS: string[] = ['www.kkinstagram.com', 'kkinstagram.com'];
 
   static isInstagramUrl(url: string): boolean {
     return url.indexOf('instagram.com') >= 0 || url.indexOf('instagr.am') >= 0;
@@ -1570,8 +1602,67 @@ export class InstagramService {
    * /videos/{code}/1 端点；若镜像只回 HTML（上游原版行为），解析 og:video
    * / og:image 并跟跳其相对路径。全部实例失败返回 null。
    */
+  /** v1.28.1：InstaFix oEmbed JSON 端点解析（/p/{code}/json）。 */
+  static async mirrorJsonParse(host: string, code: string, sourceUrl: string): Promise<ParseResult | null> {
+    const resp = await Http.getFollow(`https://${host}/${InstagramService.shortcodePath(code)}/json`,
+      InstagramService.BOT_UA, '', 3, true);
+    const raw = resp.text;
+    if (raw.length < 20) {
+      return null;
+    }
+    try {
+      const root = JSON.parse(raw) as Record<string, Object>;
+      const isVideo = root['is_video'] === true;
+      const videoUrl = typeof root['video_url'] === 'string' ? root['video_url'] as string : '';
+      const images = root['images'];
+      const result = new ParseResult();
+      result.platform = Platform.INSTAGRAM;
+      result.sourceUrl = sourceUrl;
+      result.workType = WorkType.VIDEO;
+      const username = typeof root['username'] === 'string' ? root['username'] as string : '';
+      result.author = username;
+      const description = typeof root['description'] === 'string' ? root['description'] as string : '';
+      result.title = description.length > 0 ? description : (username.length > 0 ? `Instagram · ${username}` : 'Instagram');
+      if (isVideo && videoUrl.length > 0) {
+        const mi = new MediaItem();
+        mi.url = videoUrl;
+        mi.type = WorkType.VIDEO;
+        result.mediaItems.push(mi);
+      } else if (Array.isArray(images)) {
+        for (const img of images as Array<Object>) {
+          const u = typeof img === 'string' ? img : String((img as Record<string, Object>)['url'] ?? '');
+          if (u.length > 0) {
+            const mi2 = new MediaItem();
+            mi2.url = u;
+            mi2.type = WorkType.IMAGE;
+            result.mediaItems.push(mi2);
+          }
+        }
+        result.workType = result.mediaItems.length > 1 ? WorkType.IMAGES : WorkType.IMAGE;
+      }
+      if (result.mediaItems.length === 0) {
+        return null;
+      }
+      result.status = ParseStatus.OK;
+      return InstagramService.applyNoProxyRelay(result);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** oEmbed JSON 端点的路径类型： reels 用 /reel/，其余一律 /p/（JSON 端点实测只认这两个前缀）。 */
+  static shortcodePath(code: string): string {
+    return `p/${code}`;
+  }
   static async mirrorParse(code: string, postType: string, sourceUrl: string): Promise<ParseResult | null> {
     for (const host of InstagramService.MIRROR_HOSTS) {
+      // v1.28.1 通道：InstaFix oEmbed JSON 端点（/{type}/{code}/json）。
+      // 该 handler 与 HTML handler 独立——HTML 504（上游转 IG 超时）时
+      // JSON 常仍可用；结构固定：images[] / is_video / video_url。
+      const meta = await InstagramService.mirrorJsonParse(host, code, sourceUrl);
+      if (meta !== null) {
+        return meta;
+      }
       const entry = `https://${host}/${postType}/${code}/`;
       // forceSystem：镜像站国内可达，强制系统网络，避免被应用代理拖垮
       const page = await Http.getFollow(entry, InstagramService.BOT_UA, '', 3, true);

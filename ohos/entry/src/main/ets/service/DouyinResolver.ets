@@ -17,9 +17,9 @@
  */
 import { webview } from '@kit.ArkWeb';
 
-/** 桌面 Chrome UA（www.douyin.com 桌面页用，videdown 同款）。 */
+/** 桌面 Chrome UA（www.douyin.com 桌面页用，videdown 同款；v1.28.1 升 131 降旧版本风控）。 */
 const RESOLVER_UA: string = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 /**
  * document-start 注入：hook fetch/XHR，捕获页面自身发出的 detail API 响应
@@ -322,10 +322,36 @@ const RESOLVER_JS: string = `(function () {
 /** 单次解析的注入尝试上限与间隔（挑战跳转后每次 onPageEnd 重置）。 */
 const MAX_ATTEMPTS: number = 14;
 const RETRY_DELAY_MS: number = 1400;
-/** 解析总超时：挑战跳转 + 异步数据可能超过 30s。 */
+/** 解析超时：挑战跳转 + 异步数据可能超过 30s。 */
 const RESOLVE_TIMEOUT_MS: number = 45000;
 /** loadUrl 失败重试上限（控制器未就绪等瞬时错误）。 */
 const MAX_LOAD_RETRIES: number = 6;
+
+/**
+ * v1.28.1 关键修复：ArkWeb runJavaScript 返回脚本求值结果的 JSON 序列化。
+ * 脚本返回字符串（JSON.stringify 的产物）时，Promise 值是再包一层引号的
+ * 形式（"{\"desc\":...}"）；"未就绪"哨兵 '{}' 则是 '"{}"'（4 字符）。
+ * v1.28.0 的 `text.length > 2` 检查因此永远通过——空哨兵被当作有效数据
+ * 提前交付，三条解析路径全落空，这正是"注入成功仍解析失败"的根因。
+ * 先解掉序列化层再判断，幂等（无外层引号时原样返回）。
+ */
+function normalizeInjected(value: string): string {
+  let text = (value !== undefined && value !== null) ? value.trim() : '';
+  let guard = 0;
+  while (text.length > 1 && text.charAt(0) === '"' && text.charAt(text.length - 1) === '"' && guard < 4) {
+    try {
+      const decoded = JSON.parse(text) as Object;
+      if (typeof decoded !== 'string') {
+        break;
+      }
+      text = decoded.trim();
+      guard++;
+    } catch (e) {
+      break;
+    }
+  }
+  return text;
+}
 
 /**
  * 服务层调用的桥（单例）：resolve(pageUrl) → Promise<json 字符串>。
@@ -384,6 +410,9 @@ export struct DouyinWebResolver {
   private controller: webview.WebviewController = new webview.WebviewController();
   /** 当前页面的注入尝试计数（页面跳转重置）。 */
   private attempts: number = 0;
+  /** 轮询循环是否在跑（v1.28.1：挑战跳转会触发多次 onPageEnd，
+   *  每次都 setTimeout 新循环会并发叠加、attempts 被多路递增提前耗尽）。 */
+  private polling: boolean = false;
   /** 控制器是否已 attach（attach 后 loadUrl 才可用）。 */
   private ready: boolean = false;
   /** 未 ready 期间到达的加载请求。 */
@@ -432,14 +461,16 @@ export struct DouyinWebResolver {
   private injectOnce(): void {
     if (!DouyinResolverBridge.hasPending()) {
       // 上游已超时/取消，停止
+      this.polling = false;
       return;
     }
     try {
       this.controller.runJavaScript(RESOLVER_JS)
         .then((value: string): void => {
-          const text: string = (value !== undefined && value !== null) ? value : '';
-          if (text.length > 2) {
+          const text = normalizeInjected(value);
+          if (text.length > 2 && text !== '{}' && text !== 'null') {
             DouyinResolverBridge.finish(text);
+            this.polling = false;
             return;
           }
           this.scheduleRetry();
@@ -456,6 +487,7 @@ export struct DouyinWebResolver {
     this.attempts++;
     if (this.attempts >= MAX_ATTEMPTS) {
       DouyinResolverBridge.finish('');
+      this.polling = false;
       return;
     }
     setTimeout((): void => {
@@ -484,11 +516,15 @@ export struct DouyinWebResolver {
         }
       })
       .onPageEnd(() => {
-        // 挑战脚本跳转会再次触发 onPageEnd：重置计数重新注入
+        // 挑战脚本跳转会再次触发 onPageEnd：重置计数重新注入。
+        // v1.28.1：轮询循环唯一化——已有循环在跑就只重置计数，不再叠开新循环。
         this.attempts = 0;
-        setTimeout((): void => {
-          this.injectOnce();
-        }, 800);
+        if (!this.polling) {
+          this.polling = true;
+          setTimeout((): void => {
+            this.injectOnce();
+          }, 800);
+        }
       })
       .onErrorReceive(() => {
         // 静默：由重试/超时兜底
