@@ -52,6 +52,12 @@ class HttpPage {
   finalUrl: string = '';
 }
 
+/** 镜像直链分类结果：kind = 'video' | 'image' | 'cover'。 */
+class MirrorMedia {
+  kind: string = '';
+  url: string = '';
+}
+
 class Http {
   static async getText(url: string, ua: string, referer: string, connectTimeout: number = 15000): Promise<string> {
     let req: http.HttpRequest | null = null;
@@ -89,8 +95,51 @@ class Http {
     }
   }
 
+  /** GET，携带额外请求头（i.instagram App API 等）。 */
+  static async getWithHeaders(url: string, ua: string, referer: string,
+    extra: Record<string, string>, connectTimeout: number = 15000): Promise<string> {
+    let req: http.HttpRequest | null = null;
+    try {
+      req = http.createHttp();
+      const header: Record<string, string> = {
+        'User-Agent': ua.length > 0 ? ua : IOS_UA,
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9'
+      };
+      if (referer.length > 0) {
+        header['Referer'] = referer;
+      }
+      const ks = Object.keys(extra);
+      for (const k of ks) {
+        header[k] = extra[k];
+      }
+      const opt: http.HttpRequestOptions = {
+        method: http.RequestMethod.GET,
+        header: header,
+        expectDataType: http.HttpDataType.STRING,
+        usingCache: false,
+        usingProxy: NetProxy.option(),
+        connectTimeout: connectTimeout,
+        readTimeout: 20000
+      };
+      const resp = await req.request(url, opt);
+      req.destroy();
+      if (resp.responseCode >= 200 && resp.responseCode < 400) {
+        const data = resp.result as string;
+        return data ? data : '';
+      }
+      return '';
+    } catch (e) {
+      if (req !== null) {
+        req.destroy();
+      }
+      return '';
+    }
+  }
+
   /** GET，手动跟随跳转，返回正文与最终 URL（短链解析需要）。 */
-  static async getFollow(url: string, ua: string, referer: string, maxHops: number): Promise<HttpPage> {
+  static async getFollow(url: string, ua: string, referer: string, maxHops: number,
+    forceSystem: boolean = false): Promise<HttpPage> {
     const out = new HttpPage();
     let current: string = url;
     for (let hop = 0; hop < maxHops; hop++) {
@@ -113,7 +162,8 @@ class Http {
           header: header,
           expectDataType: http.HttpDataType.STRING,
           usingCache: false,
-          usingProxy: NetProxy.option(),
+          // forceSystem：强制走系统网络（不走应用代理），供国内可达的镜像站使用
+          usingProxy: forceSystem ? true : NetProxy.option(),
           connectTimeout: 15000,
           readTimeout: 20000
         };
@@ -213,6 +263,31 @@ class Http {
       .replace(/&lt;/g, '<')
       .replace(/&gt;/g, '>')
       .replace(/&amp;/g, '&');
+  }
+
+  /** 手写 base64/url-safe base64 解码（结果按 ASCII 处理，供 efg 参数嗅探用）。 */
+  static base64Decode(input: string): string {
+    const alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    const safe = input.replace(/-/g, '+').replace(/_/g, '/').replace(/%3D/gi, '=');
+    let acc = 0;
+    let bits = 0;
+    let out = '';
+    for (const ch of safe) {
+      if (ch === '=') {
+        break;
+      }
+      const idx = alpha.indexOf(ch);
+      if (idx < 0) {
+        continue;
+      }
+      acc = ((acc << 6) | idx) & 0xFFFFFF;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out += String.fromCharCode((acc >> bits) & 0xFF);
+      }
+    }
+    return out;
   }
 
   static num(v: Object | undefined | null): number {
@@ -1052,11 +1127,29 @@ export class TikTokService {
   }
 }
 
-/** Instagram：graphql 免登录通道（主）+ embed/captioned 通道（备）+ og meta 兜底。 */
+/**
+ * Instagram 解析（v1.26.1 多通道）：
+ *  - 镜像通道（免代理）：InstaFix 系镜像（kkinstagram 等）bot UA 请求时 302
+ *    直出真实媒体直链——国内直连可达，思路同 X 的 fxtwitter 主通道；
+ *  - 页面通道：帖子页 HTML xig_polaris_media（scrapfly 2026-09 实测，未登录
+ *    payload 嵌在 if_not_gated_logged_out 之下，REST 风格字段）；
+ *  - graphql 通道：web /api/graphql（2026-06-29 曾下线，保留兜底）；
+ *  - App API 通道：shortcode 本地转 media_id（base64 互转，已与 ig_cache_key
+ *    交叉验证）→ i.instagram.com/api/v1/media/{id}/info/（免登录，需代理）；
+ *  - embed/captioned 与 og meta 兜底。
+ */
 export class InstagramService {
   /** graphql 接口要求的桌面 UA。 */
   static readonly DESKTOP_UA: string = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
     '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+  /** InstaFix 系镜像的 bot UA：非 bot UA 会被 302 回 instagram.com。 */
+  static readonly BOT_UA: string = 'TelegramBot (like Twitterbot)';
+  /** i.instagram App API 的客户端 UA 与应用 ID。 */
+  static readonly IG_APP_UA: string = 'Instagram 276.0.0.26.103 Android (33/13; 420dpi; 1080x2400; ' +
+    'samsung; SM-G991B; o1s; qcom; en_US; 447193818)';
+  static readonly IG_APP_ID: string = '936619743392459';
+  /** 镜像实例列表（instagramez 已验证被广告劫持，不采用）。 */
+  static readonly MIRROR_HOSTS: string[] = ['www.kkinstagram.com', 'gginstagram.com', 'vxinstagram.com'];
 
   static isInstagramUrl(url: string): boolean {
     return url.indexOf('instagram.com') >= 0 || url.indexOf('instagr.am') >= 0;
@@ -1085,11 +1178,12 @@ export class InstagramService {
   }
 
   /**
-   * 通道〇（2026 主通道，scrapfly 2026-09 实测）：帖子页 HTML 解析。
+   * 通道〇b（2026 主通道，scrapfly 2026-09 实测）：帖子页 HTML 解析。
    * 单帖 graphql 已于 2026-06-29 被 IG 下线；公开帖数据现内嵌在帖子页
    * <script type="application/json" data-sjs> 的 xig_polaris_media 里，
    * 未登录请求时真实 payload 嵌在 if_not_gated_logged_out 之下。
    * 字段为 REST 风格：image_versions2.candidates / video_versions / carousel_media。
+   * v1.26.1：桌面 UA 无数据时用移动 UA 变体重试（两种 UA 下页面 payload 不同）。
    */
   static async pageHtmlParse(code: string, postType: string): Promise<ParseResult> {
     const failed = new ParseResult();
@@ -1097,25 +1191,68 @@ export class InstagramService {
     failed.status = ParseStatus.PARSE_FAILED;
     failed.message = '页面通道无数据';
     const pageUrl = `https://www.instagram.com/${postType}/${code}/`;
-    const html = await Http.getText(pageUrl, InstagramService.DESKTOP_UA, '');
-    if (html.length === 0) {
+    let gotPage = false;
+    const uas: string[] = [InstagramService.DESKTOP_UA, IOS_UA];
+    for (const ua of uas) {
+      const html = await Http.getText(pageUrl, ua, '');
+      if (html.length === 0) {
+        continue;
+      }
+      gotPage = true;
+      const r = InstagramService.extractFromPageHtml(html, pageUrl);
+      if (r !== null) {
+        return r;
+      }
+    }
+    if (!gotPage) {
       failed.message = 'Instagram 帖子页获取失败';
       return failed;
     }
+    failed.message = '页面未包含帖子数据（可能被登录墙拦截）';
+    failed.webFallback = true;
+    return failed;
+  }
+
+  /** 帖子页 HTML 统一提取：xig_polaris_media → xdt_shortcode_media → og meta。 */
+  static extractFromPageHtml(html: string, pageUrl: string): ParseResult | null {
     const key = '"xig_polaris_media"';
     let idx = html.indexOf(key);
-    if (idx < 0) {
-      // script 内 JSON 可能整体转义（\" 形式），反转义后再找
-      const unescaped = html.split('\\"').join('"');
-      idx = unescaped.indexOf(key);
-      if (idx >= 0) {
-        return InstagramService.mapPolarisHtml(unescaped, idx, pageUrl);
-      }
-      failed.message = '页面未包含帖子数据（可能被登录墙拦截）';
-      failed.webFallback = true;
-      return failed;
+    if (idx >= 0) {
+      return InstagramService.mapPolarisHtml(html, idx, pageUrl);
     }
-    return InstagramService.mapPolarisHtml(html, idx, pageUrl);
+    // script 内 JSON 可能整体转义（\" 形式），反转义后再找
+    const unescaped = html.split('\\"').join('"');
+    idx = unescaped.indexOf(key);
+    if (idx >= 0) {
+      return InstagramService.mapPolarisHtml(unescaped, idx, pageUrl);
+    }
+    // 同页 graphql 残留形态（"xdt_shortcode_media"）—— polaris 缺失时的兜底
+    let sx = html.indexOf('"xdt_shortcode_media"');
+    let src = html;
+    if (sx < 0) {
+      sx = unescaped.indexOf('"xdt_shortcode_media"');
+      src = unescaped;
+    }
+    if (sx >= 0) {
+      const brace = src.indexOf('{', sx);
+      const jsonText = Http.extractBalancedJson(src, brace);
+      if (jsonText.length > 0) {
+        try {
+          const media = JSON.parse(jsonText) as Record<string, Object>;
+          const mapped = InstagramService.mapShortcode(media, pageUrl);
+          if (mapped.status === ParseStatus.OK && mapped.mediaItems.length > 0) {
+            return mapped;
+          }
+        } catch (e) {
+          // 落到 og meta
+        }
+      }
+    }
+    const og = InstagramService.ogMeta(html, pageUrl);
+    if (og.status === ParseStatus.OK && og.mediaItems.length > 0) {
+      return og;
+    }
+    return null;
   }
 
   /** 从 html 的 key 位置提取 xig_polaris_media 值对象并映射。 */
@@ -1252,6 +1389,208 @@ export class InstagramService {
     return result;
   }
 
+  /**
+   * 镜像通道（v1.26.1 新增，免代理）：InstaFix 系镜像对 bot UA 的请求会
+   * 302 直出真实媒体直链（fbcdn/cdninstagram）。实测 /p/{code} 照片直链
+   * 可用；视频帖直出的常是封面帧（efg vencode_tag 含 video），此时改试
+   * /videos/{code}/1 端点；若镜像只回 HTML（上游原版行为），解析 og:video
+   * / og:image 并跟跳其相对路径。全部实例失败返回 null。
+   */
+  static async mirrorParse(code: string, postType: string, sourceUrl: string): Promise<ParseResult | null> {
+    for (const host of InstagramService.MIRROR_HOSTS) {
+      const entry = `https://${host}/${postType}/${code}/`;
+      // forceSystem：镜像站国内可达，强制系统网络，避免被应用代理拖垮
+      const page = await Http.getFollow(entry, InstagramService.BOT_UA, '', 3, true);
+      const direct = InstagramService.directMediaFromFollow(page.finalUrl);
+      if (direct !== null) {
+        if (direct.kind === 'cover') {
+          // 视频帖封面帧：试 /videos/ 端点拿 mp4 直链
+          const vid = await Http.getFollow(`https://${host}/videos/${code}/1`,
+            InstagramService.BOT_UA, '', 3, true);
+          const vdirect = InstagramService.directMediaFromFollow(vid.finalUrl);
+          if (vdirect !== null && vdirect.kind === 'video') {
+            return InstagramService.buildMirrorResult(vdirect.url, direct.url, sourceUrl);
+          }
+          continue;
+        }
+        const poster = direct.kind === 'video' ? '' : direct.url;
+        return InstagramService.buildMirrorResult(direct.url, poster, sourceUrl);
+      }
+      if (page.text.length > 0) {
+        const r = await InstagramService.mirrorFromHtml(page.text, host, code, sourceUrl);
+        if (r !== null) {
+          return r;
+        }
+      }
+    }
+    return null;
+  }
+
+  /** 镜像跟跳结果分类：'video' | 'image' | 'cover'（视频封面帧）| null。 */
+  static directMediaFromFollow(finalUrl: string): MirrorMedia | null {
+    if (finalUrl.length === 0) {
+      return null;
+    }
+    const lower = finalUrl.toLowerCase();
+    const isCdn = lower.indexOf('fbcdn.net') >= 0 || lower.indexOf('cdninstagram.com') >= 0;
+    if (!isCdn) {
+      return null;
+    }
+    if (lower.indexOf('.mp4') >= 0 || lower.indexOf('/o1/v/') >= 0) {
+      const m = new MirrorMedia();
+      m.kind = 'video';
+      m.url = finalUrl;
+      return m;
+    }
+    if (lower.indexOf('.jpg') >= 0 || lower.indexOf('.jpeg') >= 0 || lower.indexOf('.png') >= 0 ||
+      lower.indexOf('.webp') >= 0) {
+      const m2 = new MirrorMedia();
+      if (InstagramService.efgMarksVideo(finalUrl)) {
+        // efg 的 vencode_tag 含 video：这是视频封面帧，不是可保存的照片
+        m2.kind = 'cover';
+      } else {
+        m2.kind = 'image';
+      }
+      m2.url = finalUrl;
+      return m2;
+    }
+    return null;
+  }
+
+  /** efg 参数（base64 的 JSON）解码后是否含 video（视频封面帧标记）。 */
+  static efgMarksVideo(url: string): boolean {
+    const m = url.match(/[?&]efg=([^&]+)/);
+    if (m === null) {
+      return false;
+    }
+    const dec = Http.base64Decode(m[1]);
+    return dec.indexOf('video') >= 0;
+  }
+
+  /** 上游原版镜像返回 HTML：og:video/og:image 指向 /videos/ /images/ 相对路径，跟跳拿直链。 */
+  static async mirrorFromHtml(html: string, host: string, code: string, sourceUrl: string): Promise<ParseResult | null> {
+    const videoMeta = InstagramService.metaContent(html, 'og:video');
+    const imageMeta = InstagramService.metaContent(html, 'og:image');
+    const resolve = async (meta: string): Promise<MirrorMedia | null> => {
+      if (meta.length === 0) {
+        return null;
+      }
+      const abs = meta.indexOf('/') === 0 ? `https://${host}${meta}` : meta;
+      const page = await Http.getFollow(abs, InstagramService.BOT_UA, '', 3, true);
+      return InstagramService.directMediaFromFollow(page.finalUrl);
+    };
+    const title = Http.decodeHtml(InstagramService.metaContent(html, 'og:title'));
+    if (videoMeta.length > 0) {
+      const v = await resolve(videoMeta);
+      if (v !== null && v.kind === 'video') {
+        let poster = '';
+        if (imageMeta.length > 0) {
+          const img = await resolve(imageMeta);
+          if (img !== null && img.kind === 'image') {
+            poster = img.url;
+          }
+        }
+        return InstagramService.buildMirrorResult(v.url, poster, sourceUrl, title);
+      }
+      return null;
+    }
+    if (imageMeta.length > 0) {
+      const img = await resolve(imageMeta);
+      if (img !== null && img.kind === 'image') {
+        return InstagramService.buildMirrorResult(img.url, img.url, sourceUrl, title);
+      }
+    }
+    return null;
+  }
+
+  /** 镜像结果打包（镜像直出单媒体；视频带封面帧时一并作 poster）。 */
+  static buildMirrorResult(url: string, poster: string, sourceUrl: string, title: string = ''): ParseResult {
+    const result = new ParseResult();
+    result.platform = Platform.INSTAGRAM;
+    result.sourceUrl = sourceUrl;
+    result.status = ParseStatus.OK;
+    result.title = title.length > 0 ? title : 'Instagram';
+    const lower = url.toLowerCase();
+    const isVideo = lower.indexOf('.mp4') >= 0 || lower.indexOf('/o1/v/') >= 0;
+    const mi = new MediaItem();
+    mi.url = url;
+    mi.type = isVideo ? WorkType.VIDEO : WorkType.IMAGES;
+    if (isVideo && poster.length > 0) {
+      mi.posterUrl = poster;
+    }
+    result.mediaItems.push(mi);
+    result.workType = mi.type;
+    result.coverUrl = isVideo ? poster : url;
+    return result;
+  }
+
+  /**
+   * App API 通道（v1.26.1 新增，免登录，需代理）：
+   * shortcode → media_id 纯 base64 互转（InstaFix embed.go mediaidToCode 的
+   * 逆变换，已与 fbcdn ig_cache_key 交叉验证）→
+   * i.instagram.com/api/v1/media/{id}/info/（公开帖免登录，限流较严）。
+   * 返回 REST 字段与 xig_polaris_media 同构，直接复用 mapPolaris。
+   */
+  static async appApiParse(code: string, sourceUrl: string): Promise<ParseResult> {
+    const failed = new ParseResult();
+    failed.platform = Platform.INSTAGRAM;
+    failed.status = ParseStatus.PARSE_FAILED;
+    failed.message = 'app api 通道无数据';
+    const mediaId = InstagramService.mediaIdFromCode(code);
+    if (mediaId.length === 0) {
+      return failed;
+    }
+    const headers: Record<string, string> = {
+      'X-IG-App-ID': InstagramService.IG_APP_ID
+    };
+    const resp = await Http.getWithHeaders(`https://i.instagram.com/api/v1/media/${mediaId}/info/`,
+      InstagramService.IG_APP_UA, '', headers);
+    if (resp.length === 0) {
+      return failed;
+    }
+    try {
+      const root = JSON.parse(resp) as Record<string, Object>;
+      const items = root['items'];
+      if (!Array.isArray(items) || (items as Array<Object>).length === 0) {
+        return failed;
+      }
+      const item = (items as Array<Object>)[0] as Record<string, Object>;
+      return InstagramService.mapPolaris(item, sourceUrl);
+    } catch (e) {
+      return failed;
+    }
+  }
+
+  /** shortcode → media_id 十进制字符串（64 进制大数转换，避开 BigInt）。 */
+  static mediaIdFromCode(code: string): string {
+    const alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    let dec = '0';
+    for (const ch of code) {
+      const idx = alpha.indexOf(ch);
+      if (idx < 0) {
+        return '';
+      }
+      dec = InstagramService.bigMulAdd(dec, 64, idx);
+    }
+    return dec;
+  }
+
+  /** 十进制字符串大数：dec * mul + add。 */
+  static bigMulAdd(dec: string, mul: number, add: number): string {
+    let carry = add;
+    let out = '';
+    for (let i = dec.length - 1; i >= 0; i--) {
+      const v = (dec.charCodeAt(i) - 48) * mul + carry;
+      out = String(v % 10) + out;
+      carry = Math.floor(v / 10);
+    }
+    while (carry > 0) {
+      out = String(carry % 10) + out;
+      carry = Math.floor(carry / 10);
+    }
+    return out;
+  }
+
   static async parse(url: string): Promise<ParseResult> {
     const failed = new ParseResult();
     failed.platform = Platform.INSTAGRAM;
@@ -1278,8 +1617,26 @@ export class InstagramService {
       return failed;
     }
     failed.message = '没有解析到 Instagram 作品媒体地址';
-    // 通道〇（主，2026-06 起唯一稳定免登录通道）：帖子页 HTML xig_polaris_media
-    const page = await InstagramService.pageHtmlParse(code, InstagramService.postType(target));
+    const postType = InstagramService.postType(target);
+    const hasProxy = NetProxy.host.length > 0;
+    let mirrorTried = false;
+    // 通道〇a（新增，免代理）：InstaFix 系镜像 302 直出真实媒体直链。
+    // 国内直连可达——与 X 走 fxtwitter 主通道同一思路；未配代理时排最前。
+    const tryMirror = async (): Promise<ParseResult | null> => {
+      if (mirrorTried) {
+        return null;
+      }
+      mirrorTried = true;
+      return InstagramService.mirrorParse(code, postType, target);
+    };
+    if (!hasProxy) {
+      const mirror = await tryMirror();
+      if (mirror !== null) {
+        return mirror;
+      }
+    }
+    // 通道〇b（主）：帖子页 HTML xig_polaris_media（需代理）
+    const page = await InstagramService.pageHtmlParse(code, postType);
     if (page.status === ParseStatus.OK && page.mediaItems.length > 0) {
       page.sourceUrl = target;
       return page;
@@ -1290,12 +1647,21 @@ export class InstagramService {
       gql.sourceUrl = target;
       return gql;
     }
+    // 通道一点五（新增）：i.instagram App API（公开帖免登录，需代理）
+    const appApi = await InstagramService.appApiParse(code, target);
+    if (appApi.status === ParseStatus.OK && appApi.mediaItems.length > 0) {
+      return appApi;
+    }
     // 通道二（备）：embed/captioned 页。注意新版 embed 页的 JSON 已转义塞进
     // contextJSON（\"shortcode_media\" 形式），需先反转义再配平提取。
-    const embedUrl = `https://www.instagram.com/${InstagramService.postType(target)}/${code}/embed/captioned/`;
+    const embedUrl = `https://www.instagram.com/${postType}/${code}/embed/captioned/`;
     const html = await Http.getText(embedUrl, IOS_UA, 'https://www.instagram.com/');
     if (html.length === 0) {
-      // instagram.com 在国内网络通常不可达：直连失败时给出明确指引
+      // instagram.com 不可达：最后再试一次镜像通道，仍失败才给出明确指引
+      const mirror2 = await tryMirror();
+      if (mirror2 !== null) {
+        return mirror2;
+      }
       failed.message = 'Instagram 解析失败（该域名在国内网络受限，或作品需登录）。可在「设置 → 网络」配置代理（如 127.0.0.1:7890）并开启「代理下载」后重试，或改用「网页提取」';
       failed.webFallback = true;
       return failed;
@@ -1320,6 +1686,10 @@ export class InstagramService {
     if (start < 0) {
       const og = InstagramService.ogMeta(html, target);
       if (og.status !== ParseStatus.OK) {
+        const mirror3 = await tryMirror();
+        if (mirror3 !== null) {
+          return mirror3;
+        }
         og.message = 'Instagram 页面未包含媒体直链（可能需登录），请开启代理后重试';
         og.webFallback = true;
       }
