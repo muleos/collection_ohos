@@ -285,6 +285,10 @@ export class MultiDownloader {
     if (url.indexOf('hdslb.com') >= 0 || url.indexOf('bilibili.com') >= 0) {
       return 'https://www.bilibili.com/';
     }
+    if (url.indexOf('kuaishou') >= 0 || url.indexOf('chenzhongtech') >= 0 ||
+      url.indexOf('djvod') >= 0) {
+      return 'https://www.kuaishou.com/';
+    }
     return '';
   }
 

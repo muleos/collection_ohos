@@ -540,6 +540,9 @@ function badgeRes(p: Platform): Resource {
   if (p === Platform.BILIBILI) {
     return $r('app.media.ic_bili');
   }
+  if (p === Platform.KUAISHOU) {
+    return $r('app.media.ic_ks');
+  }
   return $r('app.media.ic_xhs');
 }
 

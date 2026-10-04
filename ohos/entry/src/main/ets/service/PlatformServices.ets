@@ -10,6 +10,10 @@ import { DouyinResolverBridge } from './DouyinResolver';
 const IOS_UA: string = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 ' +
   '(KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1';
 
+/** 桌面 Chrome UA（快手 GraphQL / B站 playurl / 抖音 web detail 等 PC web 接口用）。 */
+const CHROME_UA: string = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
 /**
  * 海外平台代理桥：设置页「代理」（host:port）+「代理下载」开关 →
  * X / IG / TikTok 解析与媒体下载走该 HTTP 代理（ohos usingProxy）。
@@ -265,9 +269,10 @@ class Http {
     return out;
   }
 
-  /** POST 表单（Instagram graphql 等接口），返回 2xx/3xx 正文，否则空串。 */
+  /** POST 表单/JSON（Instagram graphql 等接口），返回 2xx/3xx 正文，否则空串。
+   *  forceSystem：强制走系统网络不走应用代理（国内接口用）。 */
   static async postForm(url: string, body: string, headers: Record<string, string>, ua: string,
-    referer: string): Promise<string> {
+    referer: string, forceSystem: boolean = false): Promise<string> {
     let req: http.HttpRequest | null = null;
     try {
       req = http.createHttp();
@@ -290,7 +295,7 @@ class Http {
         extraData: body,
         expectDataType: http.HttpDataType.STRING,
         usingCache: false,
-        usingProxy: NetProxy.option(),
+        usingProxy: forceSystem ? true : NetProxy.option(),
         connectTimeout: 15000,
         readTimeout: 20000
       };
@@ -465,6 +470,24 @@ export class DouyinService {
     }
   }
 
+  /** web detail API（aweme/v1/web/aweme/detail）返回 aweme_detail 单对象。 */
+  static fromAwemeDetail(text: string, sourceUrl: string): ParseResult | null {
+    try {
+      const root = JSON.parse(text) as Record<string, Object>;
+      const detail = root['aweme_detail'] as Record<string, Object>;
+      if (detail === null || detail === undefined) {
+        return null;
+      }
+      const result = new ParseResult();
+      result.platform = Platform.DOUYIN;
+      result.sourceUrl = sourceUrl;
+      const built = DouyinService.buildFromAweme(detail, result);
+      return built.status === ParseStatus.OK ? built : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
   /** 兜底：直接从页面源码抓 CDN 直链（抖音不再内联作品数据时的唯一办法）。 */
   static fromHtmlUrls(html: string, sourceUrl: string): ParseResult | null {
     const flat = html.replace(/\\\//g, '/');
@@ -571,14 +594,21 @@ export class DouyinService {
           return r;
         }
       }
-      const detail = await Http.getText('https://www.douyin.com/aweme/v1/web/aweme/detail/?device_platform=webapp' +
+      // web detail API（v1.27.0 修复）：videdown 同款 PC web 接口，桌面 Chrome UA +
+      // 握手 Cookie（ttwid）+ Referer；响应字段是 aweme_detail（此前误用
+      // item_list 解析器导致拿到数据也解析失败）。仍兼容 item_list 结构。
+      const detail = await Http.getFollow('https://www.douyin.com/aweme/v1/web/aweme/detail/?device_platform=webapp' +
         '&aid=6383&channel=channel_pc_web&aweme_id=' + id + '&pc_client_type=1&version_code=170400' +
         '&version_name=17.4.0&cookie_enabled=true&platform=PC&downlink=10',
-      IOS_UA, 'https://www.douyin.com/');
-      if (detail.length > 0) {
-        const r = DouyinService.fromItemList(detail, sourceUrl);
+      CHROME_UA, 'https://www.douyin.com/', 1, true, page.cookies, false);
+      if (detail.text.length > 0) {
+        const r = DouyinService.fromAwemeDetail(detail.text, sourceUrl);
         if (r !== null) {
           return r;
+        }
+        const r2 = DouyinService.fromItemList(detail.text, sourceUrl);
+        if (r2 !== null) {
+          return r2;
         }
       }
     }
@@ -727,6 +757,20 @@ export class DouyinService {
       const playAddr = video['play_addr'] as Record<string, Object>;
       if (playAddr !== null && playAddr !== undefined) {
         const candidates: string[] = [];
+        // bit_rate 多码率列表（videdown 同源数据）：优先收 h264 高清直链
+        if (Array.isArray(video['bit_rate'])) {
+          for (const br of video['bit_rate'] as Array<Object>) {
+            const rec = br as Record<string, Object>;
+            const brAddr = rec['play_addr'] as Record<string, Object>;
+            if (brAddr !== null && brAddr !== undefined && Array.isArray(brAddr['url_list'])) {
+              for (const u of brAddr['url_list'] as Array<Object>) {
+                if (typeof u === 'string') {
+                  candidates.push(u as string);
+                }
+              }
+            }
+          }
+        }
         const uri = typeof playAddr['uri'] === 'string' ? playAddr['uri'] as string : '';
         if (uri.length > 0) {
           candidates.push('https://www.iesdouyin.com/aweme/v1/play/?line=0&video_id=' +
@@ -2152,6 +2196,150 @@ export class InstagramService {
   }
 }
 
+/**
+ * 快手（v1.27.0，移植自 videdown）：GraphQL visionVideoDetail 主通道，免登录。
+ *  - photoId：/short-video/xxx、/fw/photo/xxx 或 photoId= 参数；
+ *  - 短链：v.kuaishou.com / /f/xxx 经 getFollow 跟随重定向后提取；
+ *  - GraphQL：先访问 www.kuaishou.com 首页种 Cookie（kpf/kpn/did），
+ *    POST www.kuaishou.com/graphql 查询 photo（caption/封面/时长/photoUrl/
+ *    manifest 多码率），选最高清晰度 representation 兜底 photoUrl；
+ *  - 直链下载实测免 Referer（206 video/mp4），封面直链可直接展示。
+ */
+export class KuaishouService {
+  static isKuaishouUrl(url: string): boolean {
+    return url.indexOf('kuaishou.com') >= 0 || url.indexOf('chenzhongtech.com') >= 0;
+  }
+
+  static photoId(url: string): string {
+    const m = url.match(/\/short-video\/([0-9A-Za-z]+)/) ||
+      url.match(/\/fw\/photo\/([0-9A-Za-z]+)/) ||
+      url.match(/photoId=([0-9A-Za-z]+)/) ||
+      url.match(/\/photo\/([0-9A-Za-z]+)/);
+    return m !== null ? m[1] : '';
+  }
+
+  static isShortLink(url: string): boolean {
+    return url.indexOf('v.kuaishou.com') >= 0 || /\/f\/[0-9A-Za-z]+/.test(url);
+  }
+
+  static fail(url: string, msg: string): ParseResult {
+    const p = new ParseResult();
+    p.platform = Platform.KUAISHOU;
+    p.sourceUrl = url;
+    p.status = ParseStatus.PARSE_FAILED;
+    p.message = msg;
+    return p;
+  }
+
+  static async parse(url: string): Promise<ParseResult> {
+    const target = url.indexOf('http') === 0 ? url : 'https://' + url;
+    // 1) 短链跟随重定向拿 photoId（顺带收集跳转 Cookie）
+    let cookies = '';
+    let pid = KuaishouService.photoId(target);
+    if (pid.length === 0 || KuaishouService.isShortLink(target)) {
+      const page = await Http.getFollow(target, CHROME_UA, 'https://www.kuaishou.com/', 5,
+        true, '', true);
+      cookies = page.cookies;
+      const finalUrl = page.finalUrl.length > 0 ? page.finalUrl : target;
+      pid = KuaishouService.photoId(finalUrl);
+      if (pid.length === 0 && page.text.length > 0) {
+        const m = page.text.match(/"photoId"\s*:\s*"([0-9A-Za-z]+)"/) ||
+          page.text.match(/"photo_id"\s*:\s*"?([0-9A-Za-z]+)"?/);
+        pid = m !== null ? m[1] : '';
+      }
+      if (pid.length === 0) {
+        return KuaishouService.fail(url, '未识别到快手作品编号，请确认是视频分享链接');
+      }
+    }
+    // 2) 首页握手种 Cookie（GraphQL 需要 kpf/clientid/kpn/did）
+    if (cookies.length === 0) {
+      const home = await Http.getFollow('https://www.kuaishou.com/', CHROME_UA, '', 2,
+        true, '', true);
+      cookies = home.cookies;
+    }
+    // 3) GraphQL 查询
+    const gql = '{"operationName":"VisionVideoDetail","variables":{"photoId":"' + pid +
+      '"},"query":"query VisionVideoDetail($photoId: String!) { visionVideoDetail(photoId: ' +
+      '$photoId) { status photo { id duration caption coverUrl photoUrl photoH265Url ' +
+      'manifest { adaptationSet { representation { id url width height avgBitrate } } } } } }"}';
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    };
+    if (cookies.length > 0) {
+      headers['Cookie'] = cookies;
+    }
+    const text = await Http.postForm('https://www.kuaishou.com/graphql', gql, headers,
+      CHROME_UA, 'https://www.kuaishou.com/', true);
+    if (text.length === 0) {
+      return KuaishouService.fail(url, '快手接口请求失败（网络受限），请稍后重试');
+    }
+    try {
+      const root = JSON.parse(text) as Record<string, Object>;
+      const data = root['data'] as Record<string, Object>;
+      const vvd = data !== null && data !== undefined ?
+        data['visionVideoDetail'] as Record<string, Object> : null;
+      const photo = vvd !== null && vvd !== undefined ?
+        vvd['photo'] as Record<string, Object> : null;
+      if (photo === null || photo === undefined) {
+        return KuaishouService.fail(url, '快手作品不存在或已删除');
+      }
+      const title = typeof photo['caption'] === 'string' ?
+        (photo['caption'] as string).trim() : '';
+      const coverUrl = typeof photo['coverUrl'] === 'string' ? photo['coverUrl'] as string : '';
+      // 候选直链：manifest 最高清晰度 + photoUrl + H265 兜底
+      const candidates: string[] = [];
+      let bestH = -1;
+      let bestUrl = '';
+      const manifest = photo['manifest'] as Record<string, Object>;
+      if (manifest !== null && manifest !== undefined && Array.isArray(manifest['adaptationSet'])) {
+        for (const set of manifest['adaptationSet'] as Array<Object>) {
+          const rec = set as Record<string, Object>;
+          if (!Array.isArray(rec['representation'])) {
+            continue;
+          }
+          for (const rep of rec['representation'] as Array<Object>) {
+            const r = rep as Record<string, Object>;
+            const u = typeof r['url'] === 'string' ? r['url'] as string : '';
+            const h = Http.num(r['height']);
+            if (u.length > 0 && h > bestH) {
+              bestH = h;
+              bestUrl = u;
+            }
+          }
+        }
+      }
+      if (bestUrl.length > 0) {
+        candidates.push(bestUrl);
+      }
+      if (typeof photo['photoUrl'] === 'string' && (photo['photoUrl'] as string).length > 0) {
+        candidates.push(photo['photoUrl'] as string);
+      }
+      if (typeof photo['photoH265Url'] === 'string' && (photo['photoH265Url'] as string).length > 0) {
+        candidates.push(photo['photoH265Url'] as string);
+      }
+      if (candidates.length === 0) {
+        return KuaishouService.fail(url, '未解析到快手视频直链（作品可能仅登录可见）');
+      }
+      const result = new ParseResult();
+      result.platform = Platform.KUAISHOU;
+      result.sourceUrl = target;
+      result.status = ParseStatus.OK;
+      result.noteId = typeof photo['id'] === 'string' ? photo['id'] as string : pid;
+      result.title = title.length > 0 ? title : '快手视频';
+      result.workType = WorkType.VIDEO;
+      result.coverUrl = coverUrl;
+      const mi = new MediaItem();
+      mi.url = candidates[0];
+      mi.type = WorkType.VIDEO;
+      result.mediaItems.push(mi);
+      return result;
+    } catch (e) {
+      return KuaishouService.fail(url, '快手解析失败（接口返回异常）');
+    }
+  }
+}
+
 /** 平台识别 + 分发。 */
 /**
  * B站（v1.24.0）：公开 API 免登录通道。
@@ -2297,15 +2485,18 @@ export class BilibiliService {
     if (cid === 0) {
       return BilibiliService.failed(url, '未取得 B站视频 cid', true);
     }
-    // 播放直链（html5 通道合成 mp4，免登录）
+    // 播放直链（html5 通道合成 mp4，免登录；v1.27.0 补 buvid3 握手 Cookie 防 403）
     const playApi = (isAv
       ? `https://api.bilibili.com/x/player/playurl?aid=${bvid.substring(2)}&cid=${cid}`
       : `https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${cid}`) +
       '&qn=64&type=MP4&platform=html5&high_quality=1';
+    const biliHome = await Http.getFollow('https://www.bilibili.com/', CHROME_UA, '', 1,
+      true, '', true);
     let videoUrl = '';
     try {
-      const playText = await Http.getText(playApi, IOS_UA, 'https://www.bilibili.com/');
-      const play = JSON.parse(playText) as Record<string, Object>;
+      const playResp = await Http.getFollow(playApi, CHROME_UA, 'https://www.bilibili.com/', 1,
+        true, biliHome.cookies, false);
+      const play = JSON.parse(playResp.text) as Record<string, Object>;
       const pdata = play['data'] as Record<string, Object>;
       if (pdata !== undefined && pdata !== null && Array.isArray(pdata['durl']) &&
         (pdata['durl'] as Array<Object>).length > 0) {
@@ -2396,7 +2587,9 @@ export class MediaParser {
       /(?:https?:\/\/)?(?:www\.|vm\.|vt\.)?tiktok\.com\/[^\s"'<>，。；！？、【】《》\\^`{|}]+/gi,
       // B站 / b23 短链
       /(?:https?:\/\/)?(?:www\.|m\.)?bilibili\.com\/[^\s"'<>，。；！？、【】《》\\^`{|}]+/gi,
-      /(?:https?:\/\/)?b23\.tv\/[A-Za-z0-9]+/gi
+      /(?:https?:\/\/)?b23\.tv\/[A-Za-z0-9]+/gi,
+      // 快手 / v 短链（含 chenzhongtech 分享域）
+      /(?:https?:\/\/)?(?:[A-Za-z0-9-]+\.)*(?:kuaishou\.com|chenzhongtech\.com)\/[^\s"'<>，。；！？、【】《》\\^`{|}]*/gi
     ];
     for (const re of strict) {
       let m: RegExpExecArray | null = re.exec(input);
@@ -2459,6 +2652,9 @@ export class MediaParser {
     if (BilibiliService.isBilibiliUrl(url)) {
       return Platform.BILIBILI;
     }
+    if (KuaishouService.isKuaishouUrl(url)) {
+      return Platform.KUAISHOU;
+    }
     return Platform.UNKNOWN;
   }
 
@@ -2475,6 +2671,8 @@ export class MediaParser {
         return XService.parse(url);
       case Platform.BILIBILI:
         return BilibiliService.parse(url);
+      case Platform.KUAISHOU:
+        return KuaishouService.parse(url);
       default: {
         const failed = new ParseResult();
         failed.sourceUrl = url;

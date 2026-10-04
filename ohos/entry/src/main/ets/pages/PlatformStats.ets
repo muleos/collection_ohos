@@ -35,6 +35,9 @@ function badgeRes(p: Platform): Resource {
   if (p === Platform.BILIBILI) {
     return $r('app.media.ic_bili');
   }
+  if (p === Platform.KUAISHOU) {
+    return $r('app.media.ic_ks');
+  }
   return $r('app.media.ic_xhs');
 }
 
@@ -64,7 +67,7 @@ struct PlatformStats {
     // 固定顺序：小红书 / 抖音 / Instagram / X 默认显示；
     // TikTok / B站等其余平台仅在收藏页有该平台作品时显示（v1.24.0）
     const order: Platform[] = [Platform.XHS, Platform.DOUYIN, Platform.INSTAGRAM, Platform.X,
-      Platform.TIKTOK, Platform.BILIBILI];
+      Platform.TIKTOK, Platform.BILIBILI, Platform.KUAISHOU];
     const map: Map<Platform, StatRow> = new Map();
     for (const p of order) {
       const row = new StatRow();
