@@ -686,6 +686,8 @@ export struct MediaViewer {
   private viewportHeight: number = 0;
   @StorageLink('topAvoid') topAvoid: number = 0;
   @StorageLink('bottomAvoid') bottomAvoid: number = 0;
+  /** v1.26.2：深浅色标记——玻璃胶囊文字/底色跟随主题反色 */
+  @StorageProp('isDarkMode') isDarkMode: boolean = false;
 
   aboutToAppear(): void {
     this.setStatusBarContent(true);
@@ -898,6 +900,25 @@ export struct MediaViewer {
     }
   }
 
+  /** 系统分享面板分享作品原始链接（v1.26.2：查看器长按菜单新增）。 */
+  private async shareLink(): Promise<void> {
+    if (this.item.sourceUrl.length === 0) {
+      toast('该作品没有原始链接');
+      return;
+    }
+    try {
+      const data = new systemShare.SharedData({
+        utd: uniformTypeDescriptor.UniformDataType.PLAIN_TEXT,
+        content: this.item.sourceUrl
+      });
+      const controller = new systemShare.ShareController(data);
+      await controller.show(getContext(this) as common.UIAbilityContext,
+        { previewMode: systemShare.SharePreviewMode.DEFAULT });
+    } catch (e) {
+      toast('分享失败：' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
   /** 复制当前图片到系统剪贴板（本地文件解码 PixelMap，VHome v1.22.0 同姿势）。 */
   private async copyImage(): Promise<void> {
     const paths = this.item.mediaPaths;
@@ -935,6 +956,7 @@ export struct MediaViewer {
     promptAction.showActionMenu({
       title: '图片操作',
       buttons: [
+        { text: '分享链接', color: btnColor },
         { text: '分享图片', color: btnColor },
         { text: '保存当前原图', color: btnColor },
         { text: '保存全部原图', color: btnColor },
@@ -942,13 +964,42 @@ export struct MediaViewer {
       ]
     }).then((result: promptAction.ActionMenuSuccessResponse): void => {
       if (result.index === 0) {
-        this.shareCurrent();
+        this.shareLink();
       } else if (result.index === 1) {
-        this.saveCurrent();
+        this.shareCurrent();
       } else if (result.index === 2) {
-        this.onSaveAll();
+        this.saveCurrent();
       } else if (result.index === 3) {
+        this.onSaveAll();
+      } else if (result.index === 4) {
         this.copyImage();
+      }
+    }).catch((): void => {
+      // 用户点了蒙层取消
+    });
+  }
+
+  /** 长按视频弹出的操作菜单（v1.26.2：与图片菜单一致 + 分享链接）。 */
+  private showVideoActions(): void {
+    const isDark: boolean = AppStorage.get<boolean>('isDarkMode') === true;
+    const btnColor: string = isDark ? '#FFFFFF' : '#E5000000';
+    promptAction.showActionMenu({
+      title: '视频操作',
+      buttons: [
+        { text: '分享链接', color: btnColor },
+        { text: '分享视频', color: btnColor },
+        { text: '保存当前视频', color: btnColor },
+        { text: '保存全部', color: btnColor }
+      ]
+    }).then((result: promptAction.ActionMenuSuccessResponse): void => {
+      if (result.index === 0) {
+        this.shareLink();
+      } else if (result.index === 1) {
+        this.shareCurrent();
+      } else if (result.index === 2) {
+        this.saveCurrent();
+      } else if (result.index === 3) {
+        this.onSaveAll();
       }
     }).catch((): void => {
       // 用户点了蒙层取消
@@ -1068,6 +1119,18 @@ export struct MediaViewer {
                   .width('100%')
                   .height('100%')
                   .objectFit(ImageFit.Contain)
+                  // v1.26.2：系统播放条抬离小白条/边缘——左右下留边不再被遮挡；
+                  // 黑底由根 Stack 兜底，Contain 下仅留黑边不影响画面
+                  .margin({
+                    left: 4,
+                    right: 4,
+                    bottom: Math.max(this.bottomAvoid, this.bottomInset) + 8
+                  })
+                  // v1.26.2：长按弹视频操作菜单（与图片页一致；单击仍交给系统播放条）
+                  .gesture(LongPressGesture({ fingers: 1, repeat: false, duration: 500 })
+                    .onAction((): void => {
+                      this.showVideoActions();
+                    }))
               } else {
                 // 图片节点常驻：手势只改属性，双击缩放不重新解码、不闪
                 Image(this.fileUri(p))
@@ -1114,69 +1177,40 @@ export struct MediaViewer {
         })
       }
 
-      // 覆盖层：顶部（返回 / 计数 / 分享）+ 底部操作条。
+      // 覆盖层：顶部（仅计数）+ 底部操作条。
+      // v1.26.2：顶部返回/分享圆钮删除——系统返回手势先关查看器
+      //（Index.onBackPress），分享/保存入口移入长按菜单。
       // Transparent 放行触摸给下层 Swiper（VHome v1.43.6 同款修复）。
       Column() {
         Row() {
-          // 返回圆钮（沉浸光感玻璃）
-          Stack() {
-            SymbolGlyph($r('sys.symbol.chevron_left'))
-              .fontSize(22)
-              .fontColor([Theme.textPrimary])
-          }
-          .width(40)
-          .height(40)
-          .borderRadius(20)
-          .backgroundColor('#66FFFFFF')
-          .backgroundBlurStyle(BlurStyle.Regular)
-          .border({ width: 0.5, color: '#40FFFFFF' })
-          .onClick(() => {
-            this.onClose();
-          })
-
           Text(`${this.current + 1} / ${Math.max(1, this.item.mediaPaths.length)}`)
             .fontSize(14)
             .fontColor('#FFFFFF')
-            .layoutWeight(1)
             .textAlign(TextAlign.Center)
-
-          // 分享圆钮（沉浸光感玻璃）
-          Stack() {
-            SymbolGlyph($r('sys.symbol.share'))
-              .fontSize(20)
-              .fontColor([Theme.textPrimary])
-          }
-          .width(40)
-          .height(40)
-          .borderRadius(20)
-          .backgroundColor('#66FFFFFF')
-          .backgroundBlurStyle(BlurStyle.Regular)
-          .border({ width: 0.5, color: '#40FFFFFF' })
-          .onClick(() => {
-            this.shareCurrent();
-          })
         }
         .width('100%')
+        .justifyContent(FlexAlign.Center)
         .alignItems(VerticalAlign.Center)
-        .padding({ left: 16, right: 16, top: this.topAvoid + 10 })
+        .padding({ top: this.topAvoid + 10 })
 
         Blank()
 
         // v1.26.0：视频页「在线观看」切换（X/IG 视频远程直链流式播放）
+        // v1.26.2：胶囊底色/文字随深浅色反色——浅色下用深色玻璃+深色字，白底白字不可读修复
         if (this.item.remoteVideoUrl.length > 0 && this.isVideoPage(this.item.mediaPaths[this.current])) {
           Row({ space: 6 }) {
             SymbolGlyph($r('sys.symbol.play_fill'))
               .fontSize(14)
-              .fontColor([this.playRemote ? Theme.accent : '#FFFFFF'])
+              .fontColor([this.playRemote ? Theme.accent : (this.isDarkMode ? '#FFFFFF' : '#E5000000')])
             Text(this.playRemote ? '正在在线观看，点此切回本地' : '在线观看原始视频')
               .fontSize(13)
-              .fontColor(this.playRemote ? Theme.accent : '#FFFFFF')
+              .fontColor(this.playRemote ? Theme.accent : (this.isDarkMode ? '#FFFFFF' : '#E5000000'))
           }
           .padding({ left: 14, right: 14, top: 8, bottom: 8 })
           .borderRadius(18)
-          .backgroundColor('#66FFFFFF')
+          .backgroundColor(this.isDarkMode ? '#66000000' : '#8CFFFFFF')
           .backgroundBlurStyle(BlurStyle.Regular)
-          .border({ width: 0.5, color: '#40FFFFFF' })
+          .border({ width: 0.5, color: this.isDarkMode ? '#40FFFFFF' : '#33FFFFFF' })
           .margin({ bottom: 10 })
           .onClick(() => {
             this.playRemote = !this.playRemote;
