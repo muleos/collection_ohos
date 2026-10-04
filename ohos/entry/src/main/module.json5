@@ -69,7 +69,13 @@
           {
             "entities": ["entity.system.browsable"],
             "actions": ["ohos.want.action.viewData"],
+            // v1.26.2：通用 scheme 条目——任意 http(s) 链接的分享面板/「打开方式」
+            // 里都会列出「收藏」，选中即进入解析页（host 省略 = 匹配该协议全部域名，
+            // 官方 uris 匹配规则：scheme 必填、host 可选、domainVerify 默认 false）。
+            // 下方白名单保留：部分系统版本对通配 scheme 匹配不完整时兜底。
             "uris": [
+              { "scheme": "http" },
+              { "scheme": "https" },
               { "scheme": "https", "host": "xiaohongshu.com" },
               { "scheme": "https", "host": "www.xiaohongshu.com" },
               { "scheme": "https", "host": "xhslink.com" },
