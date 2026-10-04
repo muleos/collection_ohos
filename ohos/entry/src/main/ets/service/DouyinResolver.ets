@@ -1,10 +1,18 @@
 /**
- * 抖音 WebView 解析器（v1.26.5，SaveAny DouyinWebResolver 同构）
+ * 抖音 WebView 解析器（v1.26.6，SaveAny DouyinWebResolver 同构）
  *
- * 直连通道被抖音风控/异步加载拦住时兜底：隐藏 Web 组件加载分享页，
- * onPageEnd 后注入 JS 抓 _ROUTER_DATA + DOM（视频/图集直链、标题、作者），
- * 返回 JSON 字符串交由 DouyinService.fromResolverJson 映射。
- * 服务层通过 DouyinResolverBridge 调用；Web 组件由 Index 根 Stack 常驻挂载。
+ * 直连通道已被抖音 JS 挑战壳拦截（分享页返回空 body + jsvmp 混淆脚本，
+ * _ROUTER_DATA 不再出现在首屏 HTML），WebView 内核执行挑战脚本跳到真实
+ * 页面后仍能拿到完整作品数据——这是直连失败后的唯一兜底通道。
+ *
+ * v1.26.6 修复（解析仍全败的根因）：
+ * 1. Web 组件此前 .visibility(Hidden) 不参与渲染，WebView 可能不加载页面
+ *    /不执行挑战 JS——改为渲染在屏外（position 屏外 + opacity 0.01）。
+ * 2. 注入此前只在 onPageEnd 后执行一次，挑战跳转/异步数据未就绪时取空——
+ *    改为多轮重试注入（每轮失败后 1.4s 再试，页面每次跳转重置计数，
+ *    最多 8 次或拿到有效数据为止），由桥统一幂等交付。
+ * 3. 服务层 resolve reject（busy/未挂载）此前未捕获会中断整个解析——
+ *    调用侧已改为 try-catch。
  */
 import { webview } from '@kit.ArkWeb';
 
@@ -215,9 +223,13 @@ const RESOLVER_JS: string = `(function () {
   });
 })();`;
 
+/** 单次解析的注入尝试上限与间隔（挑战跳转后每次 onPageEnd 重置）。 */
+const MAX_ATTEMPTS: number = 8;
+const RETRY_DELAY_MS: number = 1400;
+
 /**
  * 服务层调用的桥（单例）：resolve(pageUrl) → Promise<json 字符串>。
- * 超时 30s 兜底；同一时刻只允许一个解析。
+ * 超时 30s 兜底；同一时刻只允许一个解析；finish 幂等。
  */
 export class DouyinResolverBridge {
   private static pending: ((jsonText: string) => void) | null = null;
@@ -240,7 +252,7 @@ export class DouyinResolverBridge {
     });
   }
 
-  /** 组件回调完成：清理并交付结果。 */
+  /** 组件回调完成：清理并交付结果（幂等，重复调用忽略）。 */
   static finish(jsonText: string): void {
     if (DouyinResolverBridge.timeoutId >= 0) {
       clearTimeout(DouyinResolverBridge.timeoutId);
@@ -252,18 +264,28 @@ export class DouyinResolverBridge {
       cb(jsonText);
     }
   }
+
+  /** 当前是否有等待中的解析请求（组件侧注入循环的停止条件）。 */
+  static hasPending(): boolean {
+    return DouyinResolverBridge.pending !== null;
+  }
 }
 
-/** 隐藏 Web 解析组件：Index 根 Stack 常驻挂载（1px、不可见）。 */
+/** 隐藏 Web 解析组件：Index 根 Stack 常驻挂载。
+ *  v1.26.6：屏外渲染（position 移出视口 + opacity 0.01），保证 WebView
+ *  正常加载页面并执行 JS 挑战脚本——此前 Hidden 不渲染导致加载不启动。 */
 @Component
 export struct DouyinWebResolver {
   @State currentUrl: string = '';
   private controller: webview.WebviewController = new webview.WebviewController();
+  /** 当前页面的注入尝试计数（页面跳转重置）。 */
+  private attempts: number = 0;
 
   aboutToAppear(): void {
     DouyinResolverBridge.loader = (url: string): void => {
       try {
         this.currentUrl = url;
+        this.attempts = 0;
         this.controller.loadUrl(url);
       } catch (e) {
         DouyinResolverBridge.finish('');
@@ -275,34 +297,61 @@ export struct DouyinWebResolver {
     DouyinResolverBridge.loader = null;
   }
 
+  /** 单轮注入：有效 JSON 立即交付；无效则按重试间隔再试，至上限。 */
+  private injectOnce(): void {
+    if (!DouyinResolverBridge.hasPending()) {
+      // 上游已超时/取消，停止
+      return;
+    }
+    try {
+      this.controller.runJavaScript(RESOLVER_JS)
+        .then((value: string): void => {
+          const text: string = (value !== undefined && value !== null) ? value : '';
+          if (text.length > 2) {
+            DouyinResolverBridge.finish(text);
+            return;
+          }
+          this.scheduleRetry();
+        })
+        .catch((): void => {
+          this.scheduleRetry();
+        });
+    } catch (e) {
+      this.scheduleRetry();
+    }
+  }
+
+  private scheduleRetry(): void {
+    this.attempts++;
+    if (this.attempts >= MAX_ATTEMPTS) {
+      DouyinResolverBridge.finish('');
+      return;
+    }
+    setTimeout((): void => {
+      this.injectOnce();
+    }, RETRY_DELAY_MS);
+  }
+
   build() {
     Web({ src: 'about:blank', controller: this.controller, renderMode: RenderMode.SYNC_RENDER })
-      .width(1)
-      .height(1)
+      .width(320)
+      .height(240)
       .opacity(0.01)
-      .visibility(Visibility.Hidden)
+      .position({ x: -4000, y: -4000 })
       .javaScriptAccess(true)
       .domStorageAccess(true)
       .multiWindowAccess(false)
       .zoomAccess(false)
       .userAgent(RESOLVER_UA)
       .onPageEnd(() => {
+        // 挑战脚本跳转会再次触发 onPageEnd：重置计数重新注入
+        this.attempts = 0;
         setTimeout((): void => {
-          try {
-            this.controller.runJavaScript(RESOLVER_JS)
-              .then((value: string): void => {
-                DouyinResolverBridge.finish(value !== undefined && value !== null ? value : '');
-              })
-              .catch((): void => {
-                DouyinResolverBridge.finish('');
-              });
-          } catch (e) {
-            DouyinResolverBridge.finish('');
-          }
+          this.injectOnce();
         }, 800);
       })
       .onErrorReceive(() => {
-        // 静默：由超时兜底
+        // 静默：由重试/超时兜底
       })
   }
 }

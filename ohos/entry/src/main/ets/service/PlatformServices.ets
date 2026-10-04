@@ -515,10 +515,20 @@ export class DouyinService {
       }
     }
     // 通道四（兜底，v1.26.5，SaveAny 同款）：隐藏 WebView 加载分享页，
-    // onPageEnd 后注入 JS 抓 _ROUTER_DATA + DOM——直连被风控/异步加载
-    // 拦住时，WebView 内核渲染后仍能拿到完整作品数据。
-    const webUrl = entry.length > 0 ? entry : url;
-    const viaWeb = await DouyinResolverBridge.resolve(webUrl);
+    // 多轮注入抓 _ROUTER_DATA + DOM——直连被 JS 挑战壳/风控拦住时，
+    // WebView 内核执行挑战脚本跳到真实页面后仍能拿到完整作品数据。
+    // v1.26.6：有 aweme id 时直接加载 share 长链（少一次短链跳转），
+    // resolve reject（busy/未挂载）不再中断整个解析。
+    let webUrl = entry.length > 0 ? entry : url;
+    if (id.length > 0) {
+      webUrl = `https://www.iesdouyin.com/share/${DouyinService.postType(sourceUrl.length > 0 ? sourceUrl : url)}/${id}`;
+    }
+    let viaWeb = '';
+    try {
+      viaWeb = await DouyinResolverBridge.resolve(webUrl);
+    } catch (e) {
+      viaWeb = '';
+    }
     if (viaWeb.length > 0 && viaWeb !== '{}') {
       const r = DouyinService.fromResolverJson(viaWeb, sourceUrl);
       if (r !== null) {
@@ -1186,7 +1196,9 @@ export class InstagramService {
     'samsung; SM-G991B; o1s; qcom; en_US; 447193818)';
   static readonly IG_APP_ID: string = '936619743392459';
   /** 镜像实例列表（instagramez 已验证被广告劫持，不采用）。 */
-  static readonly MIRROR_HOSTS: string[] = ['www.kkinstagram.com', 'gginstagram.com', 'vxinstagram.com'];
+  // v1.26.6 实测：vxinstagram 对所有请求 401（实例已死）、gginstagram 证书坏、
+  // ddinstagram 国内直连不可达——公共实例仅剩 kkinstagram 可用。
+  static readonly MIRROR_HOSTS: string[] = ['www.kkinstagram.com'];
 
   static isInstagramUrl(url: string): boolean {
     return url.indexOf('instagram.com') >= 0 || url.indexOf('instagr.am') >= 0;
@@ -1504,7 +1516,7 @@ export class InstagramService {
     }
     // v1.26.5：头像直链过滤（profile pic 目录 t51.2885-19 / 150x150 缩略）——
     // 不是帖子照片，误用会导致「只解析到头像」
-    if (lower.indexOf('2885-19') >= 0 || lower.indexOf('/s150x150/') >= 0) {
+    if (InstagramService.isProfilePicUrl(finalUrl)) {
       return null;
     }
     if (lower.indexOf('.mp4') >= 0 || lower.indexOf('/o1/v/') >= 0) {
@@ -1526,6 +1538,23 @@ export class InstagramService {
       return m2;
     }
     return null;
+  }
+
+  /**
+   * 头像直链判定（v1.26.6 统一入口）：t51.2885-19 是 IG 头像专用 CDN 目录；
+   * /sNNNxNNN/ 是 CDN 缩略尺寸段（头像常见 150x150）。登录墙/主页分享场景
+   * 下 og:image 常回落到头像——不过滤就会「解析到头像」。
+   */
+  static isProfilePicUrl(url: string): boolean {
+    const lower = url.toLowerCase();
+    if (lower.indexOf('2885-19') >= 0) {
+      return true;
+    }
+    if (lower.indexOf('profile_pic') >= 0) {
+      return true;
+    }
+    const m = lower.match(/\/s(\d{2,4})x\1\//);
+    return m !== null && Number(m[1]) <= 320;
   }
 
   /** efg 参数（base64 的 JSON）解码后是否含 video（视频封面帧标记）。 */
@@ -1666,7 +1695,12 @@ export class InstagramService {
       return failed;
     }
     const headers: Record<string, string> = {
-      'X-IG-App-ID': InstagramService.IG_APP_ID
+      'X-IG-App-ID': InstagramService.IG_APP_ID,
+      'X-Requested-With': 'XMLHttpRequest',
+      'X-ASBD-ID': '129477',
+      'X-IG-WWW-Claim': '0',
+      'Accept': 'application/json',
+      'X-CSRFToken': 'missing'
     };
     const resp = await Http.getWithHeaders(`https://i.instagram.com/api/v1/media/${mediaId}/info/`,
       InstagramService.IG_APP_UA, '', headers);
@@ -1777,60 +1811,22 @@ export class InstagramService {
     if (appApi.status === ParseStatus.OK && appApi.mediaItems.length > 0) {
       return appApi;
     }
-    // 通道二（备）：embed/captioned 页。注意新版 embed 页的 JSON 已转义塞进
-    // contextJSON（\"shortcode_media\" 形式），需先反转义再配平提取。
-    const embedUrl = `https://www.instagram.com/${postType}/${code}/embed/captioned/`;
-    const html = await Http.getText(embedUrl, IOS_UA, 'https://www.instagram.com/');
-    if (html.length === 0) {
-      // instagram.com 不可达：最后再试一次镜像通道，仍失败才给出明确指引
-      const mirror2 = await tryMirror();
-      if (mirror2 !== null) {
-        return mirror2;
-      }
-      failed.message = 'Instagram 解析失败（该域名在国内网络受限，或作品需登录）。可在「设置 → 网络」配置代理（如 127.0.0.1:7890）并开启「代理下载」后重试，或改用「网页提取」';
-      failed.webFallback = true;
-      return failed;
+    // 通道二（备）：embed/captioned 页（v1.26.6 提取为方法 + 双 UA 变体）。
+    // 注意新版 embed 页的 JSON 已转义塞进 contextJSON（\"shortcode_media\"
+    // 形式），需先反转义再配平提取；数据中心 IP 被登录墙时 bot UA 的
+    // 简化 embed 常常仍可用。
+    const embed = await InstagramService.embedParse(code, postType, target);
+    if (embed.status === ParseStatus.OK && embed.mediaItems.length > 0) {
+      return embed;
     }
-    let start = html.indexOf('"shortcode_media"');
-    if (start < 0) {
-      const unescaped = html.split('\\"').join('"');
-      start = unescaped.indexOf('"shortcode_media"');
-      if (start >= 0) {
-        const brace = unescaped.indexOf('{', start);
-        const jsonText = Http.extractBalancedJson(unescaped, brace);
-        if (jsonText.length > 0) {
-          try {
-            const media = JSON.parse(jsonText) as Record<string, Object>;
-            return InstagramService.mapShortcode(media, target);
-          } catch (e) {
-            // 落到 og meta
-          }
-        }
-      }
+    // 通道三：instagram.com 系全败——镜像通道兜底（免代理仍可出照片第一张）
+    const mirror2 = await tryMirror();
+    if (mirror2 !== null) {
+      return mirror2;
     }
-    if (start < 0) {
-      const og = InstagramService.ogMeta(html, target);
-      if (og.status !== ParseStatus.OK) {
-        const mirror3 = await tryMirror();
-        if (mirror3 !== null) {
-          return mirror3;
-        }
-        og.message = 'Instagram 页面未包含媒体直链（可能需登录），请开启代理后重试';
-        og.webFallback = true;
-      }
-      return og;
-    }
-    const brace2 = html.indexOf('{', start);
-    const jsonText2 = Http.extractBalancedJson(html, brace2);
-    if (jsonText2.length === 0) {
-      return InstagramService.ogMeta(html, target);
-    }
-    try {
-      const media = JSON.parse(jsonText2) as Record<string, Object>;
-      return InstagramService.mapShortcode(media, target);
-    } catch (e) {
-      return InstagramService.ogMeta(html, target);
-    }
+    failed.message = 'Instagram 解析失败（该域名在国内网络受限，或作品需登录）。可在「设置 → 网络」配置代理（如 127.0.0.1:7890）并开启「代理下载」后重试，或改用「网页提取」';
+    failed.webFallback = true;
+    return failed;
   }
 
   /**
@@ -1965,14 +1961,65 @@ export class InstagramService {
     return result;
   }
 
+  /**
+   * embed/captioned 通道（v1.26.6 提取为方法 + 双 UA）：
+   * shortcode_media（未转义/转义 contextJSON）→ og meta（已过滤头像）。
+   * 数据中心 IP 打开帖子页被登录墙时，bot UA 的简化 embed 常常仍可用。
+   */
+  static async embedParse(code: string, postType: string, sourceUrl: string): Promise<ParseResult> {
+    const failed = new ParseResult();
+    failed.platform = Platform.INSTAGRAM;
+    failed.status = ParseStatus.PARSE_FAILED;
+    failed.message = 'embed 通道无数据';
+    const embedUrl = `https://www.instagram.com/${postType}/${code}/embed/captioned/`;
+    const uas: string[] = [IOS_UA, InstagramService.BOT_UA];
+    for (const ua of uas) {
+      const html = await Http.getText(embedUrl, ua, 'https://www.instagram.com/');
+      if (html.length === 0) {
+        continue;
+      }
+      let start = html.indexOf('"shortcode_media"');
+      let src = html;
+      if (start < 0) {
+        const unescaped = html.split('\\"').join('"');
+        start = unescaped.indexOf('"shortcode_media"');
+        src = unescaped;
+      }
+      if (start >= 0) {
+        const brace = src.indexOf('{', start);
+        const jsonText = Http.extractBalancedJson(src, brace);
+        if (jsonText.length > 0) {
+          try {
+            const media = JSON.parse(jsonText) as Record<string, Object>;
+            const mapped = InstagramService.mapShortcode(media, sourceUrl);
+            if (mapped.status === ParseStatus.OK && mapped.mediaItems.length > 0) {
+              return mapped;
+            }
+          } catch (e) {
+            // 落到 og meta
+          }
+        }
+      }
+      const og = InstagramService.ogMeta(html, sourceUrl);
+      if (og.status === ParseStatus.OK && og.mediaItems.length > 0) {
+        return og;
+      }
+    }
+    return failed;
+  }
+
   static ogMeta(html: string, sourceUrl: string): ParseResult {
     const result = new ParseResult();
     result.platform = Platform.INSTAGRAM;
     result.sourceUrl = sourceUrl;
-    const image = InstagramService.metaContent(html, 'og:image');
+    const rawImage = InstagramService.metaContent(html, 'og:image');
     const video = InstagramService.metaContent(html, 'og:video');
     const title = InstagramService.metaContent(html, 'og:title');
     const desc = InstagramService.metaContent(html, 'og:description');
+    // v1.26.6：登录墙/主页分享时 og:image 常是作者头像——过滤掉，
+    // 视为无数据让后续通道（embed/appapi/镜像）继续，而不是错误保存头像。
+    const image: string =
+      (rawImage.length > 0 && !InstagramService.isProfilePicUrl(Http.decodeHtml(rawImage))) ? rawImage : '';
     if (title.length > 0) {
       result.title = Http.decodeHtml(title);
     } else if (desc.length > 0) {
